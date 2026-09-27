@@ -1,29 +1,80 @@
 # Pager
 
-File format, atomic persistence, and the foreign-file policy.
+File format, native B-Tree writes, crash safety, and the foreign-file policy.
 
 ## File Layout
+
+Every file SQLKit creates is a byte-level real SQLite database (page size
+`4096`, UTF-8 encoding), readable by rusqlite, the SQLite CLI, and CPython
+`sqlite3` — and files written by them stay readable through the milestone 1
+read path below.
 
 | Offset | Length | Content |
 |---|---|---|
 | `0` | `16` | `SQLite format 3\0` magic |
 | `16` | `2` | Page size, big-endian (`4096`) |
-| `18` | `82` | Standard SQLite header fields |
-| `100` | `6` | `TSQL01` snapshot marker |
-| `106` | `4` | Snapshot version, big-endian (`1`) |
-| `110` | `*` | JSON snapshot of tables |
-
-Every file SQLKit creates is recognized as SQLite by magic-based detectors. The JSON snapshot is an interim payload until the B-Tree pager subagent implements native page read and write.
-
-## Atomic Snapshots
-
-Saves serialize tables to `<name>.tsql-tmp`, call `fsync`, then rename over the target. Readers never observe a half-written database. New files receive restrictive permissions on Unix. Query results stream through `MappedRows`, so only one row is materialized at a time regardless of file size.
+| `18` | `82` | Standard SQLite header fields (change counter, page count, freelist trunk, schema cookie, encoding `1`) |
+| `100` | `*` | Page 1: `sqlite_master` table B-Tree root (leaf `0x0D`, or interior `0x05` for huge schemas) |
+| `4096*n` | `4096` | Table leaves (`0x0D`) and interiors (`0x05`), index leaves (`0x0A`) and interiors (`0x02`), overflow pages, freelist trunk pages |
 
 ```rust
 let conn = Connection::open("/tmp/app.sqlite").unwrap();
-conn.execute_batch("CREATE TABLE t (id TEXT PRIMARY KEY)").unwrap();
+conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
 conn.close().unwrap();
 ```
+
+## Write Path
+
+`src/btree_write.rs` rebuilds the whole database image from the in-memory
+tables on every commit and replaces the file atomically (temp file in the
+same directory + `fsync` + rename + directory `fsync`).
+
+| Step | Handling |
+|---|---|
+| `Record` | Serial types `0`-`9` plus `TEXT` (`13 + 2 * len`) / `BLOB` (`12 + 2 * len`) in UTF-8; `INTEGER` uses minimal widths (`0`/`1` as constants `8`/`9`); `INTEGER PRIMARY KEY` aliases are stored as `NULL` with the value in the cell `rowid` |
+| `Rowid` | `max + 1` per table; explicit `INTEGER PRIMARY KEY` values double as rowids; `NULL` aliases auto-assign (and are filled into the row, SQLite style) |
+| `Overflow` | Table leaves spill with the standard formula (`K = M + ((P - M) % (U - 4))`, shared with the reader); index pages use the index `((U-12)*64/255)-23` variant |
+| `Split` | Leaf cells pack greedily in key order; interior levels derive bottom-up with divider keys (max `rowid` / max index key); root splits promote a new interior root |
+| `Master` | `sqlite_master` rows for every table and plain index plus a schema-cookie bump on schema changes only |
+| `Freelist` | Rebuilds preserve the previous file size: surplus pages link into the freelist trunk (`first trunk`, `total`, trunk chain) instead of truncating |
+
+```rust
+let conn = Connection::open("/tmp/app.sqlite").unwrap();
+conn.execute("INSERT INTO t (id, v) VALUES (?1, ?2)", params![1i32, "hello"]).unwrap();
+```
+
+## Atomic Commits
+
+Commits use rollback-journal mode with strict `fsync` ordering:
+
+1. Write `<db>-journal` (SQLKit format: magic `SQLKITJ1`, version, previous file bytes) and `fsync` it plus the directory.
+2. Write the new image to `<db>.sqlkit-tmp` and `fsync` it.
+3. Rename over the target, `fsync` the file and the directory.
+4. Delete the journal and `fsync` the directory again.
+
+`Connection::open` recovers a leftover journal (rolls the previous bytes
+back) before reading. The `PRAGMA integrity_check` of every committed file
+returns `ok`. Tests simulate a crash mid-write with the
+`btree_write::set_crash_point_for` hook (test-only, path-scoped).
+
+> **Note:** The journal file is SQLKit-format, not SQLite-format. A foreign
+> (real SQLite) journal next to the file is refused with
+> `Err(SqlError::Unsupported)` instead of being applied.
+
+## WAL Policy
+
+SQLKit is a rollback-journal engine and never replays write-ahead logs. If
+a `-wal` file with content exists next to the database on open, the open
+fails with `Err(SqlError::Unsupported)` instead of silently reading stale
+rows. Checkpoint the file with SQLite first, then open it with SQLKit.
+
+## Snapshot Migration
+
+Legacy `TSQL01` snapshot files (header + marker + JSON) stay readable
+exactly as before. The first write migrates them to the native layout
+through the same atomic rename in the same directory; no temp files survive
+a commit. Snapshot files never stored indexes, so file-side indexes appear
+only for indexes created after migration.
 
 ## Read Path
 
@@ -58,14 +109,19 @@ let n: i64 = conn.query_row("SELECT COUNT(*) FROM users", (), |row| row.get(0)).
 `Connection::open` validates the 100-byte header first:
 
 - Missing magic returns `Err(SqlError::NotSqliteFile)`.
-- Valid magic with the `TSQL01` marker loads the snapshot below.
-- Valid magic without the marker is read as a foreign SQLite B-Tree file
-  (read path above): all user-table rows are loaded into the in-memory
-  engine.
+- A `-wal` file with content returns `Err(SqlError::Unsupported)`.
+- A leftover SQLKit `-journal` is rolled back before reading; a foreign journal returns `Err(SqlError::Unsupported)`.
+- Valid magic with the `TSQL01` marker loads the legacy snapshot (migrated on the first write).
+- Valid magic without the marker loads the foreign B-Tree file with rowids, schema texts, and plain index definitions; the next commit rewrites it in the native layout.
 
-> **Note:** Foreign files are read-only input. The first write persists the
-> in-memory tables in the snapshot format, replacing the foreign layout.
-> Native B-Tree writes are milestone 2 work.
+## Remaining Limits
+
+- Written files always use page size `4096` and UTF-8; foreign page sizes and UTF-16 encodings stay readable but are normalized on the next commit.
+- `WITHOUT ROWID` tables are rejected on read and never written.
+- Exotic index definitions the parser rejects (partial, expression) stay in memory only and are omitted from the file; table rows stay complete.
+- `ALTER TABLE` on a foreign table regenerates its stored `CREATE TABLE` text, normalizing exotic constraints; data is preserved.
+- Rebuilds compact and preserve file size through the freelist trunk; freed pages are not yet reused as data pages (no growth cost, always valid).
+- Files larger than 256 MiB are refused on read as a denial-of-service guard.
 
 ## Usage / Example
 

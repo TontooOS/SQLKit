@@ -1,9 +1,11 @@
-//! Foreign SQLite file reader (B-Tree pager milestone 1, read path only).
+//! Foreign SQLite file reader (B-Tree pager milestone 1, read path) plus
+//! the native write path entry point (milestone 2).
 //!
 //! Reads database files written by other SQLite implementations (for example
 //! the SQLite CLI or CPython `sqlite3`) into the in-memory engine. Writes
-//! keep using the existing snapshot format (see [`crate::pager`]); this
-//! module never writes.
+//! persist byte-level real SQLite files through the native writer (see
+//! [`crate::btree_write`], re-exported here); legacy `TSQL01` snapshot files
+//! stay readable and migrate on the first write (see [`crate::pager`]).
 //!
 //! Supported input:
 //!
@@ -20,7 +22,7 @@
 //!   statements are parsed with the existing parser ([`crate::parser`]) and a
 //!   best-effort fallback keeps column names and declared types.
 //!
-//! Known limits (milestone 2, write path):
+//! Known limits (see `wiki/Pager.md` for the milestone 2 write-path limits):
 //!
 //! - Index pages (`0x02` / `0x0A`) carry no table rows and are skipped while
 //!   scanning; tables stay correct because a full scan visits every table
@@ -37,6 +39,11 @@ use crate::parser::{self, ColumnDef};
 use crate::value::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
+/// Native write path (milestone 2): record encoding, page builder, journal
+/// and recovery live in [`crate::btree_write`], re-exported here so both
+/// entry points stay behind the `btree` module.
+pub use crate::btree_write;
 
 /// In-memory read budget for foreign files (256 MiB, denial-of-service guard).
 pub const MAX_FOREIGN_FILE_BYTES: u64 = 256 * 1024 * 1024;
@@ -988,6 +995,171 @@ pub fn find_rowid(path: &Path, table: &str, rowid: i64) -> Result<Option<Vec<cra
         }
         None => Ok(None),
     }
+}
+
+/// One index definition discovered in `sqlite_master` (milestone 2).
+///
+/// Only plain `CREATE INDEX` statements the SQLKit parser accepts are
+/// reported; exotic definitions (partial, expression) are skipped because
+/// the native writer rebuilds index contents from table rows and cannot
+/// represent them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForeignIndex {
+    /// Index display name.
+    pub name: String,
+    /// Table display name the index belongs to.
+    pub table: String,
+    /// Indexed column names in order.
+    pub columns: Vec<String>,
+    /// Verbatim `CREATE INDEX` text from `sqlite_master`.
+    pub sql: String,
+}
+
+/// Full foreign database state for the native write path: engine tables
+/// plus the per-table `rowid` vectors (parallel to the rows, in the same
+/// order), the verbatim `CREATE TABLE` texts keyed by lowercase table name,
+/// display names, index definitions, schema cookie and page size.
+#[derive(Clone, Debug)]
+pub struct ForeignDatabase {
+    pub tables: HashMap<String, Table>,
+    pub rowids: HashMap<String, Vec<i64>>,
+    pub schemas: HashMap<String, String>,
+    pub display_names: HashMap<String, String>,
+    pub indexes: Vec<ForeignIndex>,
+    pub schema_cookie: u32,
+    pub page_size: u32,
+}
+
+/// Parse one `sqlite_master` index row into a [`ForeignIndex`]. Returns
+/// `None` for internal indexes (`sqlite_%`), rows without SQL, and SQL the
+/// engine parser rejects.
+fn foreign_index(name: String, table: String, sql: String) -> Option<ForeignIndex> {
+    if name.starts_with("sqlite_") || sql.trim().is_empty() {
+        return None;
+    }
+    match parser::parse_one(&sql) {
+        Ok(parser::Stmt::CreateIndex { columns, .. }) => {
+            if columns.is_empty() {
+                return None;
+            }
+            Some(ForeignIndex { name, table, columns, sql })
+        }
+        _ => None,
+    }
+}
+
+/// Load a foreign SQLite file with rowids, schema texts and index
+/// definitions for the native write path. Table loading matches
+/// [`load_foreign_with_stats`] exactly; the extra state lets the writer
+/// rebuild the same schema byte-for-byte on the next commit.
+pub fn load_foreign_detailed(path: &Path) -> Result<ForeignDatabase> {
+    let image = Image::load(path)?;
+    let mut stats = ForeignStats {
+        page_size: image.header.page_size,
+        ..ForeignStats::default()
+    };
+    let payloads = image.collect_payloads(1, &mut stats)?;
+    // First pass: user tables plus raw index rows from `sqlite_master`.
+    let mut schemas: Vec<SchemaEntry> = Vec::new();
+    let mut raw_indexes: Vec<(String, String, String)> = Vec::new();
+    for (_, payload) in &payloads {
+        let record = parse_record(payload, image.header.encoding)?;
+        let text = |index: usize| match record.get(index) {
+            Some(crate::value::Value::Text(value)) => Some(value.clone()),
+            _ => None,
+        };
+        let kind = text(0).unwrap_or_default();
+        let name = text(1).unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        if kind.eq_ignore_ascii_case("table") {
+            if name.starts_with("sqlite_") {
+                continue;
+            }
+            let rootpage = match record.get(3) {
+                Some(crate::value::Value::Integer(value)) => *value as u32,
+                Some(crate::value::Value::Real(value)) => *value as u32,
+                Some(crate::value::Value::Text(value)) => value
+                    .parse::<u32>()
+                    .map_err(|_| corrupt("bad rootpage in sqlite_master"))?,
+                _ => return Err(corrupt("bad rootpage in sqlite_master")),
+            };
+            let sql = text(4).unwrap_or_default();
+            if sql.is_empty() {
+                return Err(SqlError::parse(format!("missing CREATE TABLE for {name}")));
+            }
+            schemas.push(schema_entry(name, rootpage, sql)?);
+        } else if kind.eq_ignore_ascii_case("index") {
+            let table = text(2).unwrap_or_default();
+            let sql = text(4).unwrap_or_default();
+            if !table.is_empty() {
+                raw_indexes.push((name, table, sql));
+            }
+        }
+    }
+    // Verbatim schema texts: re-read from the same payloads so the writer
+    // preserves the original formatting byte-for-byte.
+    let mut sql_by_name: HashMap<String, String> = HashMap::new();
+    for (_, payload) in &payloads {
+        let record = parse_record(payload, image.header.encoding)?;
+        let text = |index: usize| match record.get(index) {
+            Some(crate::value::Value::Text(value)) => Some(value.clone()),
+            _ => None,
+        };
+        if text(0).unwrap_or_default().eq_ignore_ascii_case("table") {
+            let name = text(1).unwrap_or_default();
+            if !name.is_empty() && !name.starts_with("sqlite_") {
+                sql_by_name.entry(name).or_insert_with(|| text(4).unwrap_or_default());
+            }
+        }
+    }
+    let mut tables = HashMap::with_capacity(schemas.len());
+    let mut rowids = HashMap::with_capacity(schemas.len());
+    let mut schema_sql = HashMap::with_capacity(schemas.len());
+    let mut display_names = HashMap::with_capacity(schemas.len());
+    let mut stats_rows = 0usize;
+    for entry in &schemas {
+        let pairs = if entry.rootpage == 0 || entry.without_rowid {
+            Vec::new()
+        } else {
+            image.collect_payloads(entry.rootpage, &mut stats)?
+        };
+        let mut rows = Vec::with_capacity(pairs.len());
+        let mut ids = Vec::with_capacity(pairs.len());
+        for (rowid, payload) in pairs {
+            let record = parse_record(&payload, image.header.encoding)?;
+            rows.push(record_to_row(record, rowid, entry));
+            ids.push(rowid);
+        }
+        stats_rows += rows.len();
+        let _ = stats_rows;
+        rowids.insert(entry.key.clone(), ids);
+        schema_sql.insert(
+            entry.key.clone(),
+            sql_by_name.get(&entry.name).cloned().unwrap_or_default(),
+        );
+        display_names.insert(entry.key.clone(), entry.name.clone());
+        tables.insert(
+            entry.key.clone(),
+            Table { name: entry.name.clone(), columns: entry.columns.clone(), rows },
+        );
+    }
+    let mut indexes = Vec::new();
+    for (name, table, sql) in raw_indexes {
+        if let Some(index) = foreign_index(name, table, sql) {
+            indexes.push(index);
+        }
+    }
+    Ok(ForeignDatabase {
+        tables,
+        rowids,
+        schemas: schema_sql,
+        display_names,
+        indexes,
+        schema_cookie: image.header.schema_cookie,
+        page_size: image.header.page_size,
+    })
 }
 
 #[cfg(test)]

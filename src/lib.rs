@@ -1,14 +1,15 @@
 //! Tontoo SQLKit – dependency-light SQLite-compatible engine for TontooOS.
 //!
 //! SQLKit exposes a `rusqlite`-compatible subset (`Connection`, `Statement`,
-//! `params!`, `Row`, `Transaction`) over a pure-Rust engine with a SQLite
-//! file header, atomic snapshots, and streaming iterators.
+//! `params!`, `Row`, `Transaction`) over a pure-Rust engine with a real
+//! SQLite file layout, atomic commits, and streaming iterators.
 //!
 //! Basis scope (this commit): `CREATE TABLE` / `CREATE INDEX`, `INSERT`
-//! (with `OR REPLACE` / `OR IGNORE`), `SELECT` with `WHERE col = ?` filters,
-//! `UPDATE`, `DELETE`, `PRAGMA`, transactions, and file persistence.
-//! JOIN, sub-selects, triggers, views, and the full B-Tree page layout are
-//! roadmap items for follow-up subagents (see `wiki/MAIN.md`).
+//! (with `OR REPLACE` / `OR IGNORE`), `SELECT` with `WHERE` filters,
+//! `UPDATE`, `DELETE`, `PRAGMA`, transactions, and native B-Tree file
+//! persistence readable by rusqlite, the SQLite CLI, and CPython `sqlite3`.
+//! JOIN, sub-selects, triggers, views, and exotic indexes are roadmap items
+//! for follow-up subagents (see `wiki/MAIN.md`).
 //!
 //! # Quick Start
 //! ```rust
@@ -22,6 +23,7 @@
 //! ```
 
 pub mod btree;
+pub mod btree_write;
 pub mod connection;
 pub mod error;
 pub mod ffi;

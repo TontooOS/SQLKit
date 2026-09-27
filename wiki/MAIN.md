@@ -54,13 +54,16 @@ Basis engine implements `CREATE TABLE`, `CREATE INDEX`, `INSERT` with
 sub-selects, aggregates, `GROUP BY` / `HAVING`, `DISTINCT`, `UNION`,
 `ORDER BY`, `LIMIT` / `OFFSET`, `UPDATE`, `DELETE`, `PRAGMA`, and
 transactions. Foreign SQLite B-Tree files are readable (milestone 1 read
-path: header, table pages, records, overflow chains, schema discovery);
-writes always persist the snapshot format, and native B-Tree writes are
-milestone 2 work. Triggers and views are follow-up items. See
-[Pager.md](Pager.md) and [Parser.md](Parser.md) for the exact limits.
+path: header, table pages, records, overflow chains, schema discovery) and
+writes persist byte-level real SQLite files (milestone 2 native write path:
+record encoding, overflow, splits up to a new root, `sqlite_master` plus
+schema cookie, rowid `max+1`, rollback journal, WAL refusal). Triggers and
+views are follow-up items. See [Pager.md](Pager.md) and
+[Parser.md](Parser.md) for the exact limits.
 
 ## Changelog
 
+- 2026-09-27: B-Tree pager milestone 2 (NATIVE WRITE): `src/btree_write.rs` rebuilds real SQLite files on every commit (records, overflow, leaf/interior splits with root promotion, `sqlite_master`, schema cookie, freelist trunk, rollback journal with recovery, WAL refusal, snapshot migration); `tests/native_write.rs` proves rusqlite interop both directions (500 rows, reverse edits, crash recovery, freelist, cookie); documented in Pager.md.
 - 2026-09-27: Performance pass 2: per-connection parsed-statement cache, shared column storage, scratch row reuse, position-based ORDER BY window projection, COUNT(*) fast path, borrow-based prepared writes; SQLKit now beats rusqlite 0.32 in 4 of 5 identical-workload areas (file open stays an honest pager loss); 7 new regression tests; documented in Performance.md.
 - 2026-09-27: B-Tree pager milestone 1: `src/btree.rs` reads foreign SQLite files (header, table pages, records, overflow chains, schema discovery, 256 MiB guard); `Connection::open` loads them, writes keep the snapshot format; covered by `tests/foreign_read.rs` (500 rows, JOIN, GROUP BY).
 - 2026-09-27: Performance pass: added `examples/perf.rs` harness with budgets, PK lookup cache, deferred transaction snapshots, compiled scan plans, borrow-based LIKE; documented in Performance.md.

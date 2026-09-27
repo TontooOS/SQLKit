@@ -1,16 +1,17 @@
-//! File pager: SQLite header handling plus atomic snapshot persistence.
+//! File pager: SQLite header handling, legacy snapshots, and open helpers.
 //!
-//! Basis scope: every database file SQLKit creates starts with a real
-//! 100-byte SQLite header (`SQLite format 3\0`, page size 4096), followed by
-//! the marker `TSQL01` and a JSON snapshot of tables. This keeps files
-//! recognizable as SQLite and validates foreign files instead of corrupting
-//! them. Foreign SQLite B-Tree files are readable through the milestone 1
-//! read path (see [`crate::btree`]); native B-Tree writes are milestone 2
-//! work and writes keep persisting the snapshot format below.
+//! Milestone 2 scope: every database file SQLKit creates is a real native
+//! SQLite database (100-byte header, `sqlite_master` on page 1, table and
+//! index B-Trees; see [`crate::btree_write`]). Files with the legacy
+//! `TSQL01` JSON snapshot marker are still readable exactly as before, but
+//! the first write migrates them to the native layout through an atomic
+//! temp-file rename in the same directory. Foreign SQLite B-Tree files are
+//! readable through the milestone 1 read path (see [`crate::btree`]).
 //!
-//! I/O is streaming-oriented: rows are serialized incrementally and the
-//! file is replaced atomically (temp file + rename + fsync), so readers
-//! never see a half-written database.
+//! Crash safety uses rollback-journal mode and WAL files with uncheckpointed
+//! frames refuse the open; both live in [`crate::btree_write`]. I/O stays
+//! streaming-oriented: the file is replaced atomically (temp file + fsync +
+//! rename), so readers never see a half-written database.
 
 use crate::connection::Table;
 use crate::error::{Result, SqlError};
@@ -90,8 +91,10 @@ pub fn load(path: &Path) -> Result<HashMap<String, Table>> {
     Ok(tables)
 }
 
-/// Persist tables atomically: write header + marker + JSON to a temp file,
-/// fsync, then rename over the target.
+/// Persist tables atomically in the LEGACY snapshot format (header + marker
+/// + JSON). Kept for migration tests and for readers that still produce
+/// snapshots; production writes use the native B-Tree path in
+/// [`crate::btree_write::persist_native`].
 pub fn save(path: &Path, tables: &HashMap<String, Table>) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -125,7 +128,17 @@ pub fn save(path: &Path, tables: &HashMap<String, Table>) -> Result<()> {
     Ok(())
 }
 
-/// Create a fresh database file with header + empty snapshot.
+/// Create a fresh database file as a REAL minimal native SQLite database
+/// (100-byte header, empty `sqlite_master` leaf on page 1).
 pub fn create_new(path: &Path) -> Result<()> {
-    save(path, &HashMap::new())
+    crate::btree_write::create_empty_db(path)?;
+    Ok(())
+}
+
+/// True when the file at `path` carries the legacy `TSQL01` snapshot marker.
+pub fn is_snapshot_file(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    crate::btree_write::is_snapshot_bytes(&bytes)
 }
