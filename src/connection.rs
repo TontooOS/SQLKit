@@ -18,6 +18,8 @@ pub struct Column {
     pub coltype: String,
     pub primary_key: bool,
     pub not_null: bool,
+    #[serde(default)]
+    pub default: Option<Value>,
 }
 
 impl From<&ColumnDef> for Column {
@@ -27,6 +29,7 @@ impl From<&ColumnDef> for Column {
             coltype: def.coltype.clone(),
             primary_key: def.primary_key,
             not_null: def.not_null,
+            default: def.default.clone(),
         }
     }
 }
@@ -296,7 +299,7 @@ impl Connection {
                 let key = table.to_ascii_lowercase();
                 // Resolve target slots and the primary-key position with a
                 // short shared borrow; the mutation below re-borrows.
-                let (target, pk, width) = {
+                let (target, pk) = {
                     let tbl = inner.tables.get(&key).ok_or_else(|| SqlError::SqliteFailure {
                         code: 1,
                         message: format!("no such table: {table}"),
@@ -312,11 +315,17 @@ impl Connection {
                             })
                             .collect::<Result<Vec<_>>>()?
                     };
-                    (target, tbl.primary_key_index(), tbl.columns.len())
+                    (target, tbl.primary_key_index())
                 };
                 // Resolve all rows before mutating, so a bad parameter leaves
                 // the table untouched.
                 let mut staged = Vec::with_capacity(rows.len());
+                // Defaults for missing columns: existing rows and new inserts
+                // use the column default when present, otherwise NULL.
+                let defaults: Vec<Value> = {
+                    let tbl = inner.tables.get(&key).expect("table checked above");
+                    tbl.columns.iter().map(|c| c.default.clone().unwrap_or(Value::Null)).collect()
+                };
                 for exprs in rows {
                     if exprs.len() != target.len() {
                         return Err(SqlError::InvalidParameterCount {
@@ -324,7 +333,7 @@ impl Connection {
                             got: exprs.len(),
                         });
                     }
-                    let mut row = vec![Value::Null; width];
+                    let mut row = defaults.clone();
                     for (slot, expr) in target.iter().zip(exprs.iter()) {
                         row[*slot] = resolve_expr(expr, bound)?;
                     }
@@ -396,7 +405,29 @@ impl Connection {
                 inner.changes = changed;
                 Ok(changed)
             }
-            Stmt::Select { .. } => Err(SqlError::ExecuteReturnedResults),
+            Stmt::Select { .. } | Stmt::Union { .. } => Err(SqlError::ExecuteReturnedResults),
+            Stmt::AlterTable { table, column } => {
+                let mut inner = self.inner.borrow_mut();
+                let key = table.to_ascii_lowercase();
+                let tbl = inner.tables.get_mut(&key).ok_or_else(|| SqlError::SqliteFailure {
+                    code: 1,
+                    message: format!("no such table: {table}"),
+                })?;
+                if tbl.columns.iter().any(|c| c.name.eq_ignore_ascii_case(&column.name)) {
+                    return Err(SqlError::SqliteFailure {
+                        code: 1,
+                        message: format!("duplicate column name: {}", column.name),
+                    });
+                }
+                let fill = column.default.clone().unwrap_or(Value::Null);
+                let new_col = Column::from(column);
+                tbl.columns.push(new_col);
+                for row in tbl.rows.iter_mut() {
+                    row.push(fill.clone());
+                }
+                inner.changes = 0;
+                Ok(0)
+            }
             Stmt::Update {
                 table,
                 assignments,
@@ -546,6 +577,7 @@ pub(crate) fn is_write(stmt: &Stmt) -> bool {
         stmt,
         Stmt::CreateTable { .. }
             | Stmt::CreateIndex { .. }
+            | Stmt::AlterTable { .. }
             | Stmt::Insert { .. }
             | Stmt::Update { .. }
             | Stmt::Delete { .. }

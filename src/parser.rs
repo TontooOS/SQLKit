@@ -43,6 +43,134 @@ pub enum LimitValue {
     Placeholder(usize),
 }
 
+/// Aggregate function in the select list or `HAVING`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AggFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+impl AggFunc {
+    pub fn name(self) -> &'static str {
+        match self {
+            AggFunc::Count => "COUNT",
+            AggFunc::Sum => "SUM",
+            AggFunc::Avg => "AVG",
+            AggFunc::Min => "MIN",
+            AggFunc::Max => "MAX",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        if name.eq_ignore_ascii_case("COUNT") {
+            Some(AggFunc::Count)
+        } else if name.eq_ignore_ascii_case("SUM") {
+            Some(AggFunc::Sum)
+        } else if name.eq_ignore_ascii_case("AVG") {
+            Some(AggFunc::Avg)
+        } else if name.eq_ignore_ascii_case("MIN") {
+            Some(AggFunc::Min)
+        } else if name.eq_ignore_ascii_case("MAX") {
+            Some(AggFunc::Max)
+        } else {
+            None
+        }
+    }
+}
+
+/// One item in the `SELECT` projection list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectItem {
+    pub table: Option<String>,
+    pub col: String,
+    pub agg: Option<AggFunc>,
+}
+
+impl SelectItem {
+    pub fn output_name(&self) -> String {
+        match self.agg {
+            None => {
+                if let Some(t) = &self.table {
+                    format!("{t}.{}", self.col)
+                } else {
+                    self.col.clone()
+                }
+            }
+            Some(func) => {
+                if self.col == "*" {
+                    format!("{}(*)", func.name())
+                } else if let Some(t) = &self.table {
+                    format!("{}({t}.{})", func.name(), self.col)
+                } else {
+                    format!("{}({})", func.name(), self.col)
+                }
+            }
+        }
+    }
+}
+
+/// Qualified column reference used by `JOIN ... ON`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnRef {
+    pub table: Option<String>,
+    pub col: String,
+}
+
+impl ColumnRef {
+    pub fn dotted(&self) -> String {
+        match &self.table {
+            Some(t) => format!("{t}.{}", self.col),
+            None => self.col.clone(),
+        }
+    }
+}
+
+/// Join kind for `FROM a [INNER | LEFT] JOIN b ON ...`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+}
+
+/// One `JOIN` clause with a column-equality `ON` condition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JoinClause {
+    pub kind: JoinKind,
+    pub table: String,
+    pub left: ColumnRef,
+    pub right: ColumnRef,
+}
+
+/// Left side of a `HAVING` predicate: plain column or aggregate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HavingLeft {
+    Column(String),
+    Agg {
+        func: AggFunc,
+        table: Option<String>,
+        col: String,
+    },
+}
+
+/// One `HAVING` comparison against a literal or bound parameter.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HavingCond {
+    pub left: HavingLeft,
+    pub op: CmpOp,
+    pub right: Expr,
+}
+
+/// `HAVING` clause, chained with `AND` / `OR`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HavingClause {
+    Cond(HavingCond),
+    And(Vec<HavingClause>),
+    Or(Vec<HavingClause>),
+}
+
 /// Filter condition, chained with AND / OR.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WhereClause {
@@ -62,6 +190,16 @@ pub enum WhereClause {
         values: Vec<Expr>,
         negate: bool,
     },
+    InSelect {
+        col: String,
+        query: Box<Stmt>,
+        negate: bool,
+    },
+    CmpSelect {
+        col: String,
+        op: CmpOp,
+        query: Box<Stmt>,
+    },
     IsNull(String),
     IsNotNull(String),
     And(Vec<WhereClause>),
@@ -72,9 +210,7 @@ impl WhereClause {
     pub fn matches(&self, columns: &[String], row: &[Value], bound: &[Value]) -> Result<bool> {
         match self {
             WhereClause::Eq(col, expr) => {
-                let idx = columns
-                    .iter()
-                    .position(|c| c.eq_ignore_ascii_case(col))
+                let idx = resolve_col(columns, col)
                     .ok_or_else(|| SqlError::InvalidColumnName(col.clone()))?;
                 let expected = match expr {
                     Expr::Placeholder(n) => bound.get(n - 1).cloned().unwrap_or(Value::Null),
@@ -83,9 +219,7 @@ impl WhereClause {
                 Ok(values_equal(&row[idx], &expected))
             }
             WhereClause::Cmp { col, op, expr } => {
-                let idx = columns
-                    .iter()
-                    .position(|c| c.eq_ignore_ascii_case(col))
+                let idx = resolve_col(columns, col)
                     .ok_or_else(|| SqlError::InvalidColumnName(col.clone()))?;
                 let expected = match expr {
                     Expr::Placeholder(n) => bound.get(n - 1).cloned().unwrap_or(Value::Null),
@@ -94,9 +228,7 @@ impl WhereClause {
                 Ok(eval_cmp(&row[idx], &expected, *op))
             }
             WhereClause::Like { col, pattern, negate } => {
-                let idx = columns
-                    .iter()
-                    .position(|c| c.eq_ignore_ascii_case(col))
+                let idx = resolve_col(columns, col)
                     .ok_or_else(|| SqlError::InvalidColumnName(col.clone()))?;
                 let pat = match pattern {
                     Expr::Placeholder(n) => bound.get(n - 1).cloned().unwrap_or(Value::Null),
@@ -106,9 +238,7 @@ impl WhereClause {
                 Ok(if *negate { !matched } else { matched })
             }
             WhereClause::In { col, values, negate } => {
-                let idx = columns
-                    .iter()
-                    .position(|c| c.eq_ignore_ascii_case(col))
+                let idx = resolve_col(columns, col)
                     .ok_or_else(|| SqlError::InvalidColumnName(col.clone()))?;
                 let mut found = false;
                 for expr in values {
@@ -124,19 +254,18 @@ impl WhereClause {
                 Ok(if *negate { !found } else { found })
             }
             WhereClause::IsNull(col) => {
-                let idx = columns
-                    .iter()
-                    .position(|c| c.eq_ignore_ascii_case(col))
+                let idx = resolve_col(columns, col)
                     .ok_or_else(|| SqlError::InvalidColumnName(col.clone()))?;
                 Ok(row[idx].is_null())
             }
             WhereClause::IsNotNull(col) => {
-                let idx = columns
-                    .iter()
-                    .position(|c| c.eq_ignore_ascii_case(col))
+                let idx = resolve_col(columns, col)
                     .ok_or_else(|| SqlError::InvalidColumnName(col.clone()))?;
                 Ok(!row[idx].is_null())
             }
+            WhereClause::InSelect { .. } | WhereClause::CmpSelect { .. } => Err(
+                SqlError::unsupported("sub-selects require statement evaluation"),
+            ),
             WhereClause::And(items) => {
                 for item in items {
                     if !item.matches(columns, row, bound)? {
@@ -161,12 +290,48 @@ impl WhereClause {
 ///
 /// Uses first-match semantics, exactly like the `position()` scans in
 /// [`WhereClause::matches`], so compiled evaluation agrees with it row for row.
+/// Qualified names (`table.col`) also register their `col` suffix on first
+/// match, and plain names match a trailing `.name` suffix, so `col` and
+/// `table.col` resolve identically.
 pub(crate) fn column_index_map(columns: &[String]) -> HashMap<String, usize> {
-    let mut map = HashMap::with_capacity(columns.len());
+    let mut map = HashMap::with_capacity(columns.len() * 2);
     for (idx, name) in columns.iter().enumerate() {
         map.entry(name.to_ascii_lowercase()).or_insert(idx);
+        if let Some(dot) = name.rfind('.') {
+            map.entry(name[dot + 1..].to_ascii_lowercase()).or_insert(idx);
+        }
     }
+    // Plain lookup that also matches `table.col` suffixes (for `SELECT *`
+    // style plain stores queried with qualified filters and vice versa).
+    // Entries above already cover qualified stores; add reverse direction:
+    // for plain stores, qualified filters fall back via `resolve_col`.
     map
+}
+
+/// Resolve a possibly qualified column name against `columns`.
+///
+/// Exact case-insensitive match wins; otherwise a `table.col` filter matches
+/// a plain `col` store (suffix after the last `.`), and a plain filter
+/// matches the first `*.col` store. Returns the row position.
+pub(crate) fn resolve_col(columns: &[String], name: &str) -> Option<usize> {
+    if let Some(pos) = columns.iter().position(|c| c.eq_ignore_ascii_case(name)) {
+        return Some(pos);
+    }
+    if let Some(dot) = name.rfind('.') {
+        let suffix = &name[dot + 1..];
+        if let Some(pos) = columns.iter().position(|c| c.eq_ignore_ascii_case(suffix)) {
+            return Some(pos);
+        }
+    } else {
+        let qualified = format!(".{name}");
+        if let Some(pos) = columns
+            .iter()
+            .position(|c| c.len() >= qualified.len() && c[..].to_ascii_lowercase().ends_with(&qualified.to_ascii_lowercase()))
+        {
+            return Some(pos);
+        }
+    }
+    None
 }
 
 /// Resolve one expression against bound parameters a single time. Bounds are
@@ -202,9 +367,15 @@ impl WhereClause {
         bound: &[Value],
     ) -> Result<CompiledWhere> {
         let idx = |col: &String| {
-            map.get(&col.to_ascii_lowercase())
-                .copied()
-                .ok_or_else(|| SqlError::InvalidColumnName(col.clone()))
+            if let Some(i) = map.get(&col.to_ascii_lowercase()).copied() {
+                return Ok(i);
+            }
+            if let Some(dot) = col.rfind('.') {
+                if let Some(i) = map.get(&col[dot + 1..].to_ascii_lowercase()).copied() {
+                    return Ok(i);
+                }
+            }
+            Err(SqlError::InvalidColumnName(col.clone()))
         };
         match self {
             WhereClause::Eq(col, expr) => Ok(CompiledWhere::Eq(idx(col)?, resolve_once(expr, bound))),
@@ -223,6 +394,9 @@ impl WhereClause {
                 values: values.iter().map(|e| resolve_once(e, bound)).collect(),
                 negate: *negate,
             }),
+            WhereClause::InSelect { .. } | WhereClause::CmpSelect { .. } => Err(
+                SqlError::unsupported("sub-selects require statement evaluation"),
+            ),
             WhereClause::IsNull(col) => Ok(CompiledWhere::IsNull(idx(col)?)),
             WhereClause::IsNotNull(col) => Ok(CompiledWhere::IsNotNull(idx(col)?)),
             WhereClause::And(items) => items
@@ -416,13 +590,104 @@ pub(crate) fn like_match(text: &str, pattern: &str) -> bool {
     pi == pattern.len()
 }
 
-/// Column definition inside `CREATE TABLE`.
+/// Compute one aggregate over already-filtered values.
+///
+/// `COUNT(*)` counts every row (pass all values including `NULL`); the other
+/// functions skip `NULL`. Empty input yields `0` for `COUNT` and `NULL`
+/// otherwise. `SUM` returns `Integer` when all inputs are integers and
+/// `Real` otherwise; `AVG` always returns `Real`.
+pub(crate) fn compute_agg(func: AggFunc, is_star: bool, values: &[Value]) -> Value {
+    match func {
+        AggFunc::Count if is_star => Value::Integer(values.len() as i64),
+        AggFunc::Count => {
+            let n = values.iter().filter(|v| !v.is_null()).count();
+            Value::Integer(n as i64)
+        }
+        AggFunc::Sum => {
+            let mut ints: i64 = 0;
+            let mut real_sum: f64 = 0.0;
+            let mut seen_real = false;
+            let mut seen_any = false;
+            for v in values {
+                match v {
+                    Value::Null => {}
+                    Value::Integer(i) => {
+                        ints = ints.wrapping_add(*i);
+                        real_sum += *i as f64;
+                        seen_any = true;
+                    }
+                    Value::Real(f) => {
+                        real_sum += *f;
+                        seen_real = true;
+                        seen_any = true;
+                    }
+                    _ => {}
+                }
+            }
+            if !seen_any {
+                Value::Null
+            } else if seen_real {
+                Value::Real(real_sum)
+            } else {
+                Value::Integer(ints)
+            }
+        }
+        AggFunc::Avg => {
+            let mut sum = 0.0;
+            let mut n = 0usize;
+            for v in values {
+                match v {
+                    Value::Null => {}
+                    Value::Integer(i) => {
+                        sum += *i as f64;
+                        n += 1;
+                    }
+                    Value::Real(f) => {
+                        sum += *f;
+                        n += 1;
+                    }
+                    _ => {}
+                }
+            }
+            if n == 0 {
+                Value::Null
+            } else {
+                Value::Real(sum / n as f64)
+            }
+        }
+        AggFunc::Min | AggFunc::Max => {
+            let mut best: Option<&Value> = None;
+            for v in values {
+                if v.is_null() {
+                    continue;
+                }
+                match best {
+                    None => best = Some(v),
+                    Some(b) => {
+                        let ord = sort_compare(v, b);
+                        let better = match func {
+                            AggFunc::Min => ord == std::cmp::Ordering::Less,
+                            _ => ord == std::cmp::Ordering::Greater,
+                        };
+                        if better {
+                            best = Some(v);
+                        }
+                    }
+                }
+            }
+            best.cloned().unwrap_or(Value::Null)
+        }
+    }
+}
+
+/// Column definition inside `CREATE TABLE` / `ALTER TABLE ... ADD COLUMN`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ColumnDef {
     pub name: String,
     pub coltype: String,
     pub primary_key: bool,
     pub not_null: bool,
+    pub default: Option<Value>,
 }
 
 /// A single parsed statement.
@@ -451,14 +716,28 @@ pub enum Stmt {
         rows: Vec<Vec<Expr>>,
     },
     Select {
+        distinct: bool,
+        items: Vec<SelectItem>,
         columns: Vec<String>,
         star: bool,
         table: String,
+        joins: Vec<JoinClause>,
         filter: Option<WhereClause>,
+        group_by: Vec<String>,
+        having: Option<HavingClause>,
         order_by: Vec<OrderBy>,
         limit: Option<LimitValue>,
         offset: Option<LimitValue>,
         count_star: bool,
+    },
+    Union {
+        left: Box<Stmt>,
+        right: Box<Stmt>,
+        all: bool,
+    },
+    AlterTable {
+        table: String,
+        column: ColumnDef,
     },
     Update {
         table: String,
@@ -766,8 +1045,53 @@ impl Parser {
         }
     }
 
+    fn parse_column_ref(&mut self) -> Result<ColumnRef> {
+        let first = self.expect_word()?;
+        if matches!(self.peek(), Some(Token::Dot)) {
+            self.pos += 1;
+            let second = self.expect_word()?;
+            Ok(ColumnRef {
+                table: Some(first),
+                col: second,
+            })
+        } else {
+            Ok(ColumnRef {
+                table: None,
+                col: first,
+            })
+        }
+    }
+
+    fn parse_dotted_name(&mut self) -> Result<String> {
+        Ok(self.parse_column_ref()?.dotted())
+    }
+
+    fn is_subselect_start(&self) -> bool {
+        matches!(self.peek(), Some(Token::LParen))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Word(w)) if w.eq_ignore_ascii_case("SELECT"))
+    }
+
+    fn parse_subselect(&mut self, placeholder_counter: &mut usize) -> Result<Box<Stmt>> {
+        match self.next() {
+            Some(Token::LParen) => {}
+            other => return Err(SqlError::parse(format!("expected '(' before sub-select, got {other:?}"))),
+        }
+        let select_word = self.expect_word()?;
+        if !select_word.eq_ignore_ascii_case("SELECT") {
+            return Err(SqlError::parse(format!("expected SELECT in sub-select, got {select_word}")));
+        }
+        let stmt = self.parse_select_body(&select_word, placeholder_counter)?;
+        // Sub-selects may themselves be UNIONs.
+        let stmt = self.finish_union(stmt, placeholder_counter)?;
+        match self.next() {
+            Some(Token::RParen) => {}
+            other => return Err(SqlError::parse(format!("expected ')' after sub-select, got {other:?}"))),
+        }
+        Ok(Box::new(stmt))
+    }
+
     fn parse_condition(&mut self, placeholder_counter: &mut usize) -> Result<WhereClause> {
-        let col = self.expect_word()?;
+        let col = self.parse_dotted_name()?;
         if self.eat_word("IS") {
             let not = self.eat_word("NOT");
             match self.next() {
@@ -787,6 +1111,10 @@ impl Parser {
                 return Ok(WhereClause::Like { col, pattern, negate: true });
             }
             if self.eat_word("IN") {
+                if self.is_subselect_start() {
+                    let query = self.parse_subselect(placeholder_counter)?;
+                    return Ok(WhereClause::InSelect { col, query, negate: true });
+                }
                 let values = self.parse_in_list(placeholder_counter)?;
                 return Ok(WhereClause::In { col, values, negate: true });
             }
@@ -797,24 +1125,37 @@ impl Parser {
             return Ok(WhereClause::Like { col, pattern, negate: false });
         }
         if self.eat_word("IN") {
+            if self.is_subselect_start() {
+                let query = self.parse_subselect(placeholder_counter)?;
+                return Ok(WhereClause::InSelect { col, query, negate: false });
+            }
             let values = self.parse_in_list(placeholder_counter)?;
             return Ok(WhereClause::In { col, values, negate: false });
         }
         let op = match self.next() {
-            Some(Token::Eq) => None,
-            Some(Token::NotEq) => Some(CmpOp::NotEq),
-            Some(Token::Less) => Some(CmpOp::Lt),
-            Some(Token::LessEq) => Some(CmpOp::LtEq),
-            Some(Token::Greater) => Some(CmpOp::Gt),
-            Some(Token::GreaterEq) => Some(CmpOp::GtEq),
+            Some(Token::Eq) => CmpOp::Eq,
+            Some(Token::NotEq) => CmpOp::NotEq,
+            Some(Token::Less) => CmpOp::Lt,
+            Some(Token::LessEq) => CmpOp::LtEq,
+            Some(Token::Greater) => CmpOp::Gt,
+            Some(Token::GreaterEq) => CmpOp::GtEq,
             other => {
                 return Err(SqlError::parse(format!("expected operator, got {other:?}")))
             }
         };
+        if self.is_subselect_start() {
+            let query = self.parse_subselect(placeholder_counter)?;
+            if op == CmpOp::Eq {
+                // Scalar `= (SELECT ...)` expects a single row; multi-row is an
+                // execution error. Keep `Eq` shape via `CmpSelect` with `Eq`.
+                return Ok(WhereClause::CmpSelect { col, op, query });
+            }
+            return Ok(WhereClause::CmpSelect { col, op, query });
+        }
         let expr = self.parse_expr(placeholder_counter)?;
         match op {
-            None => Ok(WhereClause::Eq(col, expr)),
-            Some(op) => Ok(WhereClause::Cmp { col, op, expr }),
+            CmpOp::Eq => Ok(WhereClause::Eq(col, expr)),
+            op => Ok(WhereClause::Cmp { col, op, expr }),
         }
     }
 
@@ -849,7 +1190,7 @@ impl Parser {
         }
         let mut order_by = Vec::new();
         loop {
-            let col = self.expect_word()?;
+            let col = self.parse_dotted_name()?;
             let mut desc = false;
             if self.eat_word("DESC") {
                 desc = true;
@@ -864,6 +1205,305 @@ impl Parser {
             break;
         }
         Ok(order_by)
+    }
+
+    fn parse_select_item(&mut self) -> Result<SelectItem> {
+        // Aggregate form `FUNC(col)` / `FUNC(t.col)` / `COUNT(*)`.
+        if let Some(Token::Word(w)) = self.peek().cloned() {
+            if AggFunc::parse(&w).is_some()
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+            {
+                let func = AggFunc::parse(&w).expect("checked above");
+                self.pos += 1; // FUNC
+                self.pos += 1; // (
+                if func == AggFunc::Count && matches!(self.peek(), Some(Token::Star)) {
+                    self.pos += 1;
+                    match self.next() {
+                        Some(Token::RParen) => {}
+                        other => {
+                            return Err(SqlError::parse(format!("expected ')', got {other:?}")))
+                        }
+                    }
+                    return Ok(SelectItem {
+                        table: None,
+                        col: "*".to_owned(),
+                        agg: Some(func),
+                    });
+                }
+                let colref = self.parse_column_ref()?;
+                if colref.col == "*" {
+                    return Err(SqlError::parse("only COUNT(*) may use '*'"));
+                }
+                match self.next() {
+                    Some(Token::RParen) => {}
+                    other => return Err(SqlError::parse(format!("expected ')', got {other:?}"))),
+                }
+                return Ok(SelectItem {
+                    table: colref.table,
+                    col: colref.col,
+                    agg: Some(func),
+                });
+            }
+        }
+        let colref = self.parse_column_ref()?;
+        Ok(SelectItem {
+            table: colref.table,
+            col: colref.col,
+            agg: None,
+        })
+    }
+
+    fn parse_joins(&mut self) -> Result<Vec<JoinClause>> {
+        let mut joins = Vec::new();
+        loop {
+            let kind = if self.eat_word("INNER") {
+                if !self.eat_word("JOIN") {
+                    return Err(SqlError::parse("expected JOIN after INNER"));
+                }
+                JoinKind::Inner
+            } else if self.eat_word("LEFT") {
+                self.eat_word("OUTER");
+                if !self.eat_word("JOIN") {
+                    return Err(SqlError::parse("expected JOIN after LEFT"));
+                }
+                JoinKind::Left
+            } else if matches!(self.peek(), Some(Token::Word(w)) if w.eq_ignore_ascii_case("JOIN")) {
+                self.pos += 1;
+                JoinKind::Inner
+            } else {
+                break;
+            };
+            let table = self.expect_word()?;
+            if !self.eat_word("ON") {
+                return Err(SqlError::parse("expected ON in JOIN"));
+            }
+            let left = self.parse_column_ref()?;
+            match self.next() {
+                Some(Token::Eq) => {}
+                other => {
+                    return Err(SqlError::parse(format!(
+                        "expected '=' in JOIN ON condition, got {other:?}"
+                    )))
+                }
+            }
+            let right = self.parse_column_ref()?;
+            joins.push(JoinClause { kind, table, left, right });
+        }
+        Ok(joins)
+    }
+
+    fn parse_group_by(&mut self) -> Result<Vec<String>> {
+        if !matches!(self.peek(), Some(Token::Word(w)) if w.eq_ignore_ascii_case("GROUP")) {
+            return Ok(Vec::new());
+        }
+        self.pos += 1;
+        if !self.eat_word("BY") {
+            return Err(SqlError::parse("expected BY after GROUP"));
+        }
+        let mut cols = Vec::new();
+        loop {
+            cols.push(self.parse_dotted_name()?);
+            if matches!(self.peek(), Some(Token::Comma)) {
+                self.pos += 1;
+                continue;
+            }
+            break;
+        }
+        if cols.is_empty() {
+            return Err(SqlError::parse("GROUP BY requires at least one column"));
+        }
+        Ok(cols)
+    }
+
+    fn parse_having(&mut self, placeholder_counter: &mut usize) -> Result<Option<HavingClause>> {
+        if !self.eat_word("HAVING") {
+            return Ok(None);
+        }
+        Ok(Some(self.parse_having_or(placeholder_counter)?))
+    }
+
+    fn parse_having_or(&mut self, placeholder_counter: &mut usize) -> Result<HavingClause> {
+        let mut items = vec![self.parse_having_and(placeholder_counter)?];
+        while self.eat_word("OR") {
+            items.push(self.parse_having_and(placeholder_counter)?);
+        }
+        if items.len() == 1 {
+            Ok(items.into_iter().next().unwrap())
+        } else {
+            Ok(HavingClause::Or(items))
+        }
+    }
+
+    fn parse_having_and(&mut self, placeholder_counter: &mut usize) -> Result<HavingClause> {
+        let mut items = vec![self.parse_having_cond(placeholder_counter)?];
+        while self.eat_word("AND") {
+            items.push(self.parse_having_cond(placeholder_counter)?);
+        }
+        if items.len() == 1 {
+            Ok(items.into_iter().next().unwrap())
+        } else {
+            Ok(HavingClause::And(items))
+        }
+    }
+
+    fn parse_having_cond(&mut self, placeholder_counter: &mut usize) -> Result<HavingClause> {
+        // Aggregate left side `FUNC(col) OP expr` or plain `[t.]col OP expr`.
+        let left = if let Some(Token::Word(w)) = self.peek().cloned() {
+            if AggFunc::parse(&w).is_some()
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+            {
+                let func = AggFunc::parse(&w).expect("checked above");
+                self.pos += 1;
+                self.pos += 1;
+                if func == AggFunc::Count && matches!(self.peek(), Some(Token::Star)) {
+                    self.pos += 1;
+                    match self.next() {
+                        Some(Token::RParen) => {}
+                        other => {
+                            return Err(SqlError::parse(format!("expected ')', got {other:?}")))
+                        }
+                    }
+                    HavingLeft::Agg { func, table: None, col: "*".to_owned() }
+                } else {
+                    let colref = self.parse_column_ref()?;
+                    match self.next() {
+                        Some(Token::RParen) => {}
+                        other => {
+                            return Err(SqlError::parse(format!("expected ')', got {other:?}")))
+                        }
+                    }
+                    HavingLeft::Agg { func, table: colref.table, col: colref.col }
+                }
+            } else {
+                HavingLeft::Column(self.parse_dotted_name()?)
+            }
+        } else {
+            return Err(SqlError::parse("expected HAVING condition"));
+        };
+        let op = match self.next() {
+            Some(Token::Eq) => CmpOp::Eq,
+            Some(Token::NotEq) => CmpOp::NotEq,
+            Some(Token::Less) => CmpOp::Lt,
+            Some(Token::LessEq) => CmpOp::LtEq,
+            Some(Token::Greater) => CmpOp::Gt,
+            Some(Token::GreaterEq) => CmpOp::GtEq,
+            other => return Err(SqlError::parse(format!("expected operator in HAVING, got {other:?}"))),
+        };
+        let right = self.parse_expr(placeholder_counter)?;
+        Ok(HavingClause::Cond(HavingCond { left, op, right }))
+    }
+
+    fn parse_default_literal(&mut self) -> Result<Value> {
+        match self.next() {
+            Some(Token::Integer(v)) => Ok(Value::Integer(v)),
+            Some(Token::Real(v)) => Ok(Value::Real(v)),
+            Some(Token::Text(s)) => Ok(Value::Text(s)),
+            Some(Token::Word(w)) if w.eq_ignore_ascii_case("NULL") => Ok(Value::Null),
+            Some(Token::Word(w)) if w.eq_ignore_ascii_case("TRUE") => Ok(Value::Integer(1)),
+            Some(Token::Word(w)) if w.eq_ignore_ascii_case("FALSE") => Ok(Value::Integer(0)),
+            other => Err(SqlError::parse(format!("expected DEFAULT literal, got {other:?}"))),
+        }
+    }
+
+    fn parse_select_body(
+        &mut self,
+        _select_word: &str,
+        placeholder_counter: &mut usize,
+    ) -> Result<Stmt> {
+        let mut distinct = false;
+        if self.eat_word("DISTINCT") {
+            distinct = true;
+        } else {
+            self.eat_word("ALL");
+        }
+        let mut star = false;
+        let mut items: Vec<SelectItem> = Vec::new();
+        let mut columns: Vec<String> = Vec::new();
+        if matches!(self.peek(), Some(Token::Star)) {
+            self.pos += 1;
+            star = true;
+            if distinct {
+                // `SELECT DISTINCT *` is valid; keep both flags.
+            }
+        } else {
+            loop {
+                let item = self.parse_select_item()?;
+                columns.push(item.output_name());
+                items.push(item);
+                if matches!(self.peek(), Some(Token::Comma)) {
+                    self.pos += 1;
+                    continue;
+                }
+                break;
+            }
+            if items.is_empty() {
+                return Err(SqlError::parse("SELECT requires at least one column"));
+            }
+        }
+        if !self.eat_word("FROM") {
+            return Err(SqlError::parse("expected FROM in SELECT"));
+        }
+        let table = self.expect_word()?;
+        let joins = self.parse_joins()?;
+        let filter = if self.eat_word("WHERE") {
+            Some(self.parse_where(placeholder_counter)?)
+        } else {
+            None
+        };
+        let group_by = self.parse_group_by()?;
+        let having = self.parse_having(placeholder_counter)?;
+        if having.is_some() && group_by.is_empty() {
+            // `HAVING` without `GROUP BY` applies to the single aggregate group.
+        }
+        // `OFFSET` without `LIMIT` is a parse error (legacy rule).
+        if matches!(self.peek(), Some(Token::Word(w)) if w.eq_ignore_ascii_case("OFFSET")) {
+            return Err(SqlError::parse("OFFSET without LIMIT is not supported"));
+        }
+        let order_by = self.parse_order_by()?;
+        let (limit, offset) = self.parse_limit(placeholder_counter)?;
+        let count_star = !star
+            && !distinct
+            && joins.is_empty()
+            && group_by.is_empty()
+            && having.is_none()
+            && items.len() == 1
+            && items[0].agg == Some(AggFunc::Count)
+            && items[0].col == "*";
+        // Legacy `columns` shape: empty for `*` and `COUNT(*)`, output names otherwise.
+        let legacy_columns = if star || count_star { Vec::new() } else { columns };
+        Ok(Stmt::Select {
+            distinct,
+            items,
+            columns: legacy_columns,
+            star,
+            table,
+            joins,
+            filter,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
+            count_star,
+        })
+    }
+
+    fn finish_union(&mut self, left: Stmt, placeholder_counter: &mut usize) -> Result<Stmt> {
+        let mut acc = left;
+        while self.eat_word("UNION") {
+            let all = self.eat_word("ALL");
+            let select_word = self.expect_word()?;
+            if !select_word.eq_ignore_ascii_case("SELECT") {
+                return Err(SqlError::parse(format!("expected SELECT after UNION, got {select_word}")));
+            }
+            let right = self.parse_select_body(&select_word, placeholder_counter)?;
+            acc = Stmt::Union {
+                left: Box::new(acc),
+                right: Box::new(right),
+                all,
+            };
+        }
+        Ok(acc)
     }
 
     fn parse_limit(
@@ -944,6 +1584,7 @@ impl Parser {
                         let coltype = self.expect_word()?.to_ascii_uppercase();
                         let mut primary_key = false;
                         let mut not_null = false;
+                        let mut default: Option<Value> = None;
                         loop {
                             if self.eat_word("PRIMARY") {
                                 if !self.eat_word("KEY") {
@@ -956,7 +1597,7 @@ impl Parser {
                                 }
                                 not_null = true;
                             } else if self.eat_word("DEFAULT") {
-                                let _ = self.next();
+                                default = Some(self.parse_default_literal()?);
                             } else {
                                 break;
                             }
@@ -966,6 +1607,7 @@ impl Parser {
                             coltype,
                             primary_key,
                             not_null,
+                            default,
                         });
                         match self.peek() {
                             Some(Token::Comma) => {
@@ -1095,88 +1737,46 @@ impl Parser {
                 })
             }
             "SELECT" => {
-                if matches!(self.peek(), Some(Token::Word(w)) if w.eq_ignore_ascii_case("COUNT")) {
-                    self.pos += 1;
-                    match self.next() {
-                        Some(Token::LParen) => {}
-                        other => {
-                            return Err(SqlError::parse(format!(
-                                "expected '(' after COUNT, got {other:?}"
-                            )))
-                        }
-                    }
-                    match self.next() {
-                        Some(Token::Star) => {}
-                        other => {
-                            return Err(SqlError::parse(format!(
-                                "expected '*' in COUNT(*), got {other:?}"
-                            )))
-                        }
-                    }
-                    match self.next() {
-                        Some(Token::RParen) => {}
-                        other => return Err(SqlError::parse(format!("expected ')', got {other:?}"))),
-                    }
-                    if !self.eat_word("FROM") {
-                        return Err(SqlError::parse("expected FROM in SELECT"));
-                    }
-                    let table = self.expect_word()?;
-                    let mut counter = 0usize;
-                    let filter = if self.eat_word("WHERE") {
-                        Some(self.parse_where(&mut counter)?)
-                    } else {
-                        None
-                    };
-                    let order_by = self.parse_order_by()?;
-                    let (limit, offset) = self.parse_limit(&mut counter)?;
-                    return Ok(Stmt::Select {
-                        columns: Vec::new(),
-                        star: false,
-                        table,
-                        filter,
-                        order_by,
-                        limit,
-                        offset,
-                        count_star: true,
-                    });
-                }
-                let mut columns = Vec::new();
-                let mut star = false;
-                if matches!(self.peek(), Some(Token::Star)) {
-                    self.pos += 1;
-                    star = true;
-                } else {
-                    loop {
-                        columns.push(self.expect_word()?);
-                        match self.peek() {
-                            Some(Token::Comma) => {
-                                self.pos += 1;
-                            }
-                            _ => break,
-                        }
-                    }
-                }
-                if !self.eat_word("FROM") {
-                    return Err(SqlError::parse("expected FROM in SELECT"));
+                let mut counter = 0usize;
+                let first = self.parse_select_body(&word, &mut counter)?;
+                self.finish_union(first, &mut counter)
+            }
+            "ALTER" => {
+                if !self.eat_word("TABLE") {
+                    return Err(SqlError::parse("expected TABLE after ALTER"));
                 }
                 let table = self.expect_word()?;
-                let mut counter = 0usize;
-                let filter = if self.eat_word("WHERE") {
-                    Some(self.parse_where(&mut counter)?)
-                } else {
-                    None
-                };
-                let order_by = self.parse_order_by()?;
-                let (limit, offset) = self.parse_limit(&mut counter)?;
-                Ok(Stmt::Select {
-                    columns,
-                    star,
+                if !self.eat_word("ADD") {
+                    return Err(SqlError::parse("expected ADD in ALTER TABLE"));
+                }
+                self.eat_word("COLUMN");
+                let col_name = self.expect_word()?;
+                let coltype = self.expect_word()?.to_ascii_uppercase();
+                let mut not_null = false;
+                let mut default: Option<Value> = None;
+                loop {
+                    if self.eat_word("NOT") {
+                        if !self.eat_word("NULL") {
+                            return Err(SqlError::parse("expected NULL after NOT"));
+                        }
+                        not_null = true;
+                    } else if self.eat_word("DEFAULT") {
+                        default = Some(self.parse_default_literal()?);
+                    } else if self.eat_word("PRIMARY") {
+                        return Err(SqlError::parse("PRIMARY KEY is not allowed in ADD COLUMN"));
+                    } else {
+                        break;
+                    }
+                }
+                Ok(Stmt::AlterTable {
                     table,
-                    filter,
-                    order_by,
-                    limit,
-                    offset,
-                    count_star: false,
+                    column: ColumnDef {
+                        name: col_name,
+                        coltype,
+                        primary_key: false,
+                        not_null,
+                        default,
+                    },
                 })
             }
             "UPDATE" => {
@@ -1430,5 +2030,164 @@ mod tests {
         assert!(!like_match("ac", "a_c"));
         assert!(like_match("anything", "%"));
         assert!(!like_match("abc", "abd"));
+    }
+
+    #[test]
+    fn join_parses_inner_left_and_chained() {
+        match select("SELECT a.x, b.y FROM a INNER JOIN b ON a.x = b.y") {
+            Stmt::Select { joins, items, .. } => {
+                assert_eq!(joins.len(), 1);
+                assert_eq!(joins[0].kind, JoinKind::Inner);
+                assert_eq!(joins[0].table, "b");
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].table.as_deref(), Some("a"));
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        match select("SELECT a.x FROM a LEFT JOIN b ON a.x = b.y") {
+            Stmt::Select { joins, .. } => assert_eq!(joins[0].kind, JoinKind::Left),
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        match select("SELECT a.x FROM a JOIN b ON a.x = b.y JOIN c ON b.y = c.z") {
+            Stmt::Select { joins, .. } => assert_eq!(joins.len(), 2),
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        assert!(parse_one("SELECT a FROM a JOIN b ON a.x > b.y").is_err());
+        assert!(parse_one("SELECT a FROM a JOIN b").is_err());
+        assert!(parse_one("SELECT a FROM a INNER b ON a.x = b.y").is_err());
+    }
+
+    #[test]
+    fn subselect_parses_in_and_scalar() {
+        match select("SELECT a FROM t WHERE a IN (SELECT b FROM u WHERE c = 1)") {
+            Stmt::Select { filter: Some(WhereClause::InSelect { col, negate, .. }), .. } => {
+                assert_eq!(col, "a");
+                assert!(!negate);
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        match select("SELECT a FROM t WHERE a = (SELECT b FROM u)") {
+            Stmt::Select { filter: Some(WhereClause::CmpSelect { col, op, .. }), .. } => {
+                assert_eq!(col, "a");
+                assert_eq!(op, CmpOp::Eq);
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        match select("SELECT a FROM t WHERE a NOT IN (SELECT b FROM u)") {
+            Stmt::Select { filter: Some(WhereClause::InSelect { negate, .. }), .. } => assert!(negate),
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        assert!(parse_one("SELECT a FROM t WHERE a IN ()").is_err());
+        assert!(parse_one("SELECT a FROM t WHERE a IN (SELECT)").is_err());
+    }
+
+    #[test]
+    fn aggregates_parse_without_group() {
+        for (sql, func, col) in [
+            ("SELECT COUNT(*) FROM t", AggFunc::Count, "*"),
+            ("SELECT COUNT(a) FROM t", AggFunc::Count, "a"),
+            ("SELECT SUM(a) FROM t", AggFunc::Sum, "a"),
+            ("SELECT AVG(a) FROM t", AggFunc::Avg, "a"),
+            ("SELECT MIN(a) FROM t", AggFunc::Min, "a"),
+            ("SELECT MAX(a) FROM t", AggFunc::Max, "a"),
+        ] {
+            match select(sql) {
+                Stmt::Select { items, .. } => {
+                    assert_eq!(items.len(), 1, "wrong items for {sql}");
+                    assert_eq!(items[0].agg, Some(func), "wrong func for {sql}");
+                    assert_eq!(items[0].col, col, "wrong col for {sql}");
+                }
+                other => panic!("unexpected parse for {sql}: {other:?}"),
+            }
+        }
+        assert!(parse_one("SELECT SUM(*) FROM t").is_err());
+        assert!(parse_one("SELECT COUNT() FROM t").is_err());
+        // Legacy COUNT(*) flag keeps working.
+        match select("SELECT COUNT(*) FROM t") {
+            Stmt::Select { count_star, .. } => assert!(count_star),
+            other => panic!("unexpected parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_by_having_parse() {
+        match select("SELECT d, COUNT(*) FROM t GROUP BY d HAVING COUNT(*) > 1") {
+            Stmt::Select { group_by, having, .. } => {
+                assert_eq!(group_by, vec!["d".to_string()]);
+                assert!(matches!(having, Some(HavingClause::Cond(_))));
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        match select("SELECT a, b FROM t GROUP BY a, b HAVING a = 1 AND COUNT(*) > 2") {
+            Stmt::Select { group_by, having: Some(HavingClause::And(items)), .. } => {
+                assert_eq!(group_by.len(), 2);
+                assert_eq!(items.len(), 2);
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        assert!(parse_one("SELECT a FROM t GROUP BY").is_err());
+        assert!(parse_one("SELECT a FROM t HAVING").is_err());
+        assert!(parse_one("SELECT a FROM t HAVING COUNT(*)").is_err());
+    }
+
+    #[test]
+    fn distinct_parses() {
+        match select("SELECT DISTINCT a FROM t") {
+            Stmt::Select { distinct, items, .. } => {
+                assert!(distinct);
+                assert_eq!(items.len(), 1);
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        match select("SELECT DISTINCT * FROM t") {
+            Stmt::Select { distinct, star, .. } => {
+                assert!(distinct);
+                assert!(star);
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        // DISTINCT COUNT(*) is accepted (no-op dedup over one row).
+        match select("SELECT DISTINCT COUNT(*) FROM t") {
+            Stmt::Select { distinct, items, .. } => {
+                assert!(distinct);
+                assert_eq!(items[0].agg, Some(AggFunc::Count));
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn union_parses_all_and_plain() {
+        match parse_one("SELECT a FROM t UNION SELECT a FROM u").unwrap() {
+            Stmt::Union { all, .. } => assert!(!all),
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        match parse_one("SELECT a FROM t UNION ALL SELECT a FROM u").unwrap() {
+            Stmt::Union { all, .. } => assert!(all),
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        assert!(parse_one("SELECT a FROM t UNION").is_err());
+        assert!(parse_one("SELECT a FROM t UNION SELECT").is_err());
+    }
+
+    #[test]
+    fn alter_table_parses_add_column() {
+        match parse_one("ALTER TABLE t ADD COLUMN c TEXT NOT NULL DEFAULT 'x'").unwrap() {
+            Stmt::AlterTable { table, column } => {
+                assert_eq!(table, "t");
+                assert_eq!(column.name, "c");
+                assert!(column.not_null);
+                assert_eq!(column.default, Some(Value::Text("x".into())));
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        match parse_one("ALTER TABLE t ADD COLUMN n INTEGER DEFAULT 5").unwrap() {
+            Stmt::AlterTable { column, .. } => {
+                assert_eq!(column.default, Some(Value::Integer(5)));
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        assert!(parse_one("ALTER TABLE t ADD COLUMN c").is_err());
+        assert!(parse_one("ALTER TABLE t ADD COLUMN c TEXT PRIMARY KEY").is_err());
     }
 }

@@ -12,7 +12,7 @@ pub fn execute(&mut self, params: impl IntoParams) -> Result<usize>
 
 Runs a write statement with bound parameters and returns rows changed.
 
-- Returns `Err(SqlError::ExecuteReturnedResults)` when the statement is a `SELECT`.
+- Returns `Err(SqlError::ExecuteReturnedResults)` when the statement is a `SELECT` or `UNION`.
 - Returns `Err(SqlError::InvalidParameterCount)` on missing bindings.
 
 ```rust
@@ -42,25 +42,27 @@ Returns a lazy `Iterator<Item = Result<T>>` over mapped rows. Exactly one row is
 
 Execution order is filter, then sort, then `OFFSET` / `LIMIT`:
 
-- Without `ORDER BY` the scan stays fully lazy: the filter evaluates per row, `OFFSET` skips matching rows, and the stream ends after `LIMIT` rows.
-- With `ORDER BY` only the filtered rows are buffered for sorting; the table itself is never copied unfiltered.
-- `SELECT COUNT(*)` yields exactly one integer row (single `COUNT(*)` column); `ORDER BY`, `LIMIT`, and `OFFSET` are ignored for counts.
+- Without `ORDER BY` the scan stays fully lazy: the filter evaluates per row, `OFFSET` skips matching rows, and the stream ends after `LIMIT` rows. Non-grouped `JOIN`s stream the same way (one left row fan-out at a time).
+- With `ORDER BY` only the filtered rows are buffered for sorting; the table itself is never copied unfiltered. `ORDER BY` over a join buffers only the filtered joined rows.
+- Grouped queries (`GROUP BY` / aggregates / `HAVING`) buffer only the filtered rows of their query, then yield one row per group.
+- `SELECT COUNT(*)` and other pure aggregates yield exactly one row; `ORDER BY`, `LIMIT`, and `OFFSET` are ignored for pure aggregates.
+- `SELECT DISTINCT` deduplicates via a seen set while streaming. `UNION` (without `ALL`) deduplicates the same way; `UNION ALL` concatenates.
 
 ```rust
 let names: Vec<String> = stmt
-    .query_map(params![0i32], |row| row.get(0))
-    .unwrap()
-    .collect::<Result<Vec<_>>>()
-    .unwrap();
+  .query_map(params![0i32], |row| row.get(0))
+  .unwrap()
+  .collect::<Result<Vec<_>>>()
+  .unwrap();
 ```
 
 ```rust
 let mut stmt = conn.prepare("SELECT name FROM t ORDER BY age DESC LIMIT 5 OFFSET 10").unwrap();
 let page: Vec<String> = stmt
-    .query_map(params![], |row| row.get(0))
-    .unwrap()
-    .collect::<Result<Vec<_>>>()
-    .unwrap();
+  .query_map(params![], |row| row.get(0))
+  .unwrap()
+  .collect::<Result<Vec<_>>>()
+  .unwrap();
 ```
 
 ### `query`
@@ -77,7 +79,14 @@ Collects all rows. Prefer `query_map` for large result sets.
 pub fn column_count(&self) -> usize
 ```
 
-Returns the projected column count for `SELECT` lists, or `0` for `SELECT *` until the pager follow-up resolves star widths at prepare time.
+Returns the projected column count for `SELECT` lists, `1` for `COUNT(*)`, or `0` for `SELECT *` until the pager follow-up resolves star widths at prepare time. `UNION` reports the left side width.
+
+## Row Mapping
+
+- Single-table `SELECT *` keeps plain column names. Joined `SELECT *` exposes qualified `table.col` names.
+- Explicit qualified selections (`SELECT a.x`) keep the `table.col` output name; plain selections keep the plain name. `Row::get` matches names case-insensitively, with `table.col` / `col` suffix fallback.
+- Aggregate outputs are named `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)` (qualified as `SUM(t.col)` when qualified).
+- Grouped `ORDER BY` resolves against output columns. `LEFT JOIN` missing sides read as `NULL` (`Option<T>` via `Row::get`).
 
 ## Row Access
 

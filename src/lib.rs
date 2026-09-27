@@ -157,4 +157,50 @@ mod integration_tests {
             .unwrap();
         assert_eq!(asc, vec![0, 1, 2]);
     }
+
+    #[test]
+    fn join_group_by_having_over_fifty_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE books (id INTEGER PRIMARY KEY, author_id INTEGER, pages INTEGER);",
+        )
+        .unwrap();
+        for i in 0..5i32 {
+            conn.execute(
+                "INSERT INTO authors (id, name) VALUES (?1, ?2)",
+                params![i, format!("author{i}")],
+            )
+            .unwrap();
+        }
+        // 50 books round-robin over 5 authors; pages grow with the row id.
+        for i in 0..50i32 {
+            conn.execute(
+                "INSERT INTO books (id, author_id, pages) VALUES (?1, ?2, ?3)",
+                params![i, i % 5, 10 + i],
+            )
+            .unwrap();
+        }
+        let rows: Vec<(String, i64, i64)> = conn
+            .prepare(
+                "SELECT authors.name, COUNT(*), SUM(books.pages) FROM authors \
+                 INNER JOIN books ON authors.id = books.author_id \
+                 GROUP BY authors.name HAVING COUNT(*) > 5 ORDER BY authors.name ASC",
+            )
+            .unwrap()
+            .query_map(params![], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+            })
+            .unwrap()
+            .collect::<crate::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        // Each author owns 10 books; sums are deterministic.
+        let expected_sums = [325i64, 335, 345, 355, 365];
+        for (idx, (name, count, sum)) in rows.iter().enumerate() {
+            assert_eq!(name, &format!("author{idx}"));
+            assert_eq!(*count, 10);
+            assert_eq!(*sum, expected_sums[idx]);
+        }
+    }
 }
