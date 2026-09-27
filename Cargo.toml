@@ -1,0 +1,22 @@
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[package]
+name = "sqlkit"
+version = "26.1.0"
+edition = "2021"
+authors = ["arlomu"]
+description = "Tontoo SQLKit – dependency-light SQLite-compatible engine for TontooOS (ruslite-compatible API, streaming, file pager)"
+license = "TCL"
+repository = "https://github.com/TontooOS/SQLKit"
+keywords = ["tontoo", "sqlite", "sql", "database", "coredata"]
+categories = ["database"]
+readme = "README.md"
+
+[dependencies]
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

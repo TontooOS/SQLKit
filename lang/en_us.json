@@ -1,0 +1,9 @@
+{
+  "sqlkit.error.parse": "SQL parse error",
+  "sqlkit.error.unsupported": "Unsupported SQL feature",
+  "sqlkit.error.no_rows": "Query returned no rows",
+  "sqlkit.db.open": "Open database",
+  "sqlkit.db.close": "Close database",
+  "sqlkit.tx.commit": "Commit transaction",
+  "sqlkit.tx.rollback": "Roll back transaction"
+}

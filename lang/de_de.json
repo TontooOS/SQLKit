@@ -1,0 +1,9 @@
+{
+  "sqlkit.error.parse": "SQL-Analysefehler",
+  "sqlkit.error.unsupported": "Nicht unterstützte SQL-Funktion",
+  "sqlkit.error.no_rows": "Abfrage lieferte keine Zeilen",
+  "sqlkit.db.open": "Datenbank öffnen",
+  "sqlkit.db.close": "Datenbank schließen",
+  "sqlkit.tx.commit": "Transaktion bestätigen",
+  "sqlkit.tx.rollback": "Transaktion zurückrollen"
+}
