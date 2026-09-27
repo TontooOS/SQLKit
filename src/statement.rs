@@ -9,11 +9,18 @@ use crate::parser::{
 };
 use crate::value::{FromValue, IntoParams, Value};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+
+/// Shared column-name storage: one allocation per query plan, handed to every
+/// result row by pointer instead of cloning the name strings per row. Rows of
+/// one query always share the same schema, so this removes one `Vec` plus one
+/// `String` clone per column per row from full-table scans.
+pub(crate) type SharedColumns = Rc<Vec<String>>;
 
 /// A single result row.
 #[derive(Clone, Debug)]
 pub struct Row {
-    pub(crate) columns: Vec<String>,
+    pub(crate) columns: SharedColumns,
     pub(crate) values: Vec<Value>,
 }
 
@@ -77,11 +84,14 @@ impl<'conn> Statement<'conn> {
         match &self.stmt {
             Stmt::Select { .. } | Stmt::Union { .. } => Err(SqlError::ExecuteReturnedResults),
             other => {
-                let owned = other.clone();
-                let changed = self.conn.run_stmt(&owned, &bound)?;
+                // Borrow the stored statement in place: `run_stmt` only needs
+                // `&Stmt`, and cloning it per call showed up in bulk-write
+                // profiles. `run_stmt` borrows the connection's `inner`
+                // cell, which is disjoint from `self.stmt`.
+                let changed = self.conn.run_stmt(other, &bound)?;
                 // File-backed prepared writes are durable, exactly like
                 // `Connection::execute`; deferred while a transaction is open.
-                if crate::connection::is_write(&owned) {
+                if crate::connection::is_write(other) {
                     self.conn.persist_if_needed()?;
                 }
                 Ok(changed)
@@ -173,7 +183,7 @@ impl<'conn> Statement<'conn> {
 struct ScanPlan {
     table_key: String,
     ncols: usize,
-    out_columns: Vec<String>,
+    out_columns: SharedColumns,
     proj: Option<Vec<usize>>,
     filter: Option<CompiledWhere>,
 }
@@ -217,23 +227,35 @@ fn build_plan(
     Ok(ScanPlan {
         table_key,
         ncols: table_cols.len(),
-        out_columns,
+        out_columns: Rc::new(out_columns),
         proj,
         filter,
     })
 }
 
-fn project_planned(plan: &ScanPlan, row: &[Value]) -> Row {
+/// Fill `out` from a stored table row using a compiled plan: shared column
+/// names by pointer, values cloned into the reused buffer.
+fn project_planned_into(plan: &ScanPlan, row: &[Value], out: &mut Row) {
+    out.columns = plan.out_columns.clone();
+    out.values.clear();
     match &plan.proj {
-        None => Row {
-            columns: plan.out_columns.clone(),
-            values: row.to_vec(),
-        },
-        Some(idxs) => Row {
-            columns: plan.out_columns.clone(),
-            values: idxs.iter().map(|&i| row[i].clone()).collect(),
-        },
+        None => out.values.extend_from_slice(row),
+        Some(idxs) => {
+            out.values.reserve(idxs.len());
+            for &i in idxs {
+                out.values.push(row[i].clone());
+            }
+        }
     }
+}
+
+fn project_planned(plan: &ScanPlan, row: &[Value]) -> Row {
+    let mut out = Row {
+        columns: plan.out_columns.clone(),
+        values: Vec::new(),
+    };
+    project_planned_into(plan, row, &mut out);
+    out
 }
 
 /// Resolve a `LIMIT` / `OFFSET` bound to a row count.
@@ -292,21 +314,31 @@ pub const COUNT_COLUMN: &str = "COUNT(*)";
 
 pub(crate) fn count_row(count: i64) -> Row {
     Row {
-        columns: vec![COUNT_COLUMN.to_owned()],
+        columns: Rc::new(vec![COUNT_COLUMN.to_owned()]),
         values: vec![Value::Integer(count)],
     }
 }
 
-fn sort_table_rows(table_cols: &[String], rows: &mut [Vec<Value>], order_by: &[OrderBy]) -> Result<()> {
+/// Sort row *positions* against the stored table rows instead of sorting
+/// cloned rows. The comparator and the stable sort are identical to the old
+/// row-cloning sort, so the output order is unchanged; callers then project
+/// only the `OFFSET` / `LIMIT` window instead of every filtered row.
+fn sort_row_positions(
+    table_rows: &[Vec<Value>],
+    table_cols: &[String],
+    positions: &mut [usize],
+    order_by: &[OrderBy],
+) -> Result<()> {
     let mut keys = Vec::with_capacity(order_by.len());
     for key in order_by {
         let idx = resolve_col(table_cols, &key.col)
             .ok_or_else(|| SqlError::InvalidColumnName(key.col.clone()))?;
         keys.push((idx, key.desc));
     }
-    rows.sort_by(|a, b| {
+    positions.sort_by(|&a, &b| {
+        let (ra, rb) = (&table_rows[a], &table_rows[b]);
         for (idx, desc) in &keys {
-            let ord = sort_compare(&a[*idx], &b[*idx]);
+            let ord = sort_compare(&ra[*idx], &rb[*idx]);
             if ord != std::cmp::Ordering::Equal {
                 return if *desc { ord.reverse() } else { ord };
             }
@@ -380,24 +412,28 @@ pub(crate) fn collect_rows(
         }
         return Ok(vec![count_row(count)]);
     }
-    let mut matched: Vec<Vec<Value>> = Vec::new();
-    for row in &tbl.rows {
+    // Collect matching row positions (no row cloning), sort the positions when
+    // `ORDER BY` is present, trim to the `OFFSET` / `LIMIT` window, and project
+    // only the surviving rows. Order and window are identical to the old
+    // clone-then-sort path because the comparator and the stable sort match.
+    let mut positions: Vec<usize> = Vec::new();
+    for (pos, row) in tbl.rows.iter().enumerate() {
         let keep = match &plan.filter {
             Some(f) => f.matches_row(row),
             None => true,
         };
         if keep {
-            matched.push(row.clone());
+            positions.push(pos);
         }
     }
     if !order_by.is_empty() {
         let table_cols: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
-        sort_table_rows(&table_cols, &mut matched, order_by)?;
+        sort_row_positions(&tbl.rows, &table_cols, &mut positions, order_by)?;
     }
-    let matched = apply_offset_limit(matched, offset, limit);
-    let mut out = Vec::with_capacity(matched.len());
-    for row in &matched {
-        out.push(project_planned(&plan, row));
+    let positions = apply_offset_limit(positions, offset, limit);
+    let mut out = Vec::with_capacity(positions.len());
+    for pos in &positions {
+        out.push(project_planned(&plan, &tbl.rows[*pos]));
     }
     Ok(out)
 }
@@ -634,13 +670,17 @@ fn eval_single_select_to_rows(
         } => {
             // Simple single-table queries without new features reuse the
             // compiled-scan infrastructure exactly (keeps streaming behavior).
+            // `SELECT COUNT(*)` (no `GROUP BY` / `HAVING` / `DISTINCT` by
+            // construction, see the parser) takes the same fast path: it
+            // counts matching rows without cloning any row.
             let simple = joins.is_empty()
                 && group_by.is_empty()
                 && having.is_none()
                 && !distinct
                 && items.iter().all(|i| i.agg.is_none())
                 && !filter_has_subselect(filter.as_ref());
-            if simple {
+            let fast_count = *count_star && !filter_has_subselect(filter.as_ref());
+            if simple || fast_count {
                 return collect_rows(
                     conn,
                     table,
@@ -682,8 +722,10 @@ fn eval_single_select_to_rows(
             } else {
                 // Non-aggregated: project, DISTINCT, ORDER, LIMIT.
                 if !order_by.is_empty() && joins.is_empty() && !distinct {
-                    // Fast path reusing the compiled scan: buffer only
-                    // filtered rows for sorting (existing guarantee).
+                    // Fast path reusing the compiled scan: sort matching row
+                    // positions, then project only the `OFFSET` / `LIMIT`
+                    // window. Only filtered positions are buffered (existing
+                    // guarantee); full rows are never cloned for sorting.
                     let inner = conn.inner.borrow();
                     let tbl = inner.tables.get(&table.to_ascii_lowercase()).ok_or_else(|| {
                         SqlError::SqliteFailure { code: 1, message: format!("no such table: {table}") }
@@ -692,22 +734,22 @@ fn eval_single_select_to_rows(
                         tbl.columns.iter().map(|c| c.name.clone()).collect();
                     let map = column_index_map(&table_cols);
                     let compiled = resolved_filter.as_ref().map(|f| f.compile(&map, bound)).transpose()?;
-                    let mut matched: Vec<Vec<Value>> = Vec::new();
-                    for row in &tbl.rows {
+                    let mut positions: Vec<usize> = Vec::new();
+                    for (pos, row) in tbl.rows.iter().enumerate() {
                         let keep = match &compiled {
                             Some(f) => f.matches_row(row),
                             None => true,
                         };
                         if keep {
-                            matched.push(row.clone());
+                            positions.push(pos);
                         }
                     }
-                    sort_table_rows(&table_cols, &mut matched, order_by)?;
-                    let matched = apply_offset_limit(matched, offset_v, limit_v);
+                    sort_row_positions(&tbl.rows, &table_cols, &mut positions, order_by)?;
+                    let positions = apply_offset_limit(positions, offset_v, limit_v);
                     // Project via items (qualified supported).
-                    let mut out = Vec::with_capacity(matched.len());
-                    for row in &matched {
-                        out.push(project_single_table_row(&table_cols, row, items, *star)?);
+                    let mut out = Vec::with_capacity(positions.len());
+                    for pos in &positions {
+                        out.push(project_single_table_row(&table_cols, &tbl.rows[*pos], items, *star)?);
                     }
                     return Ok(out);
                 }
@@ -943,7 +985,7 @@ fn project_single_table_row(
 ) -> Result<Row> {
     if star {
         return Ok(Row {
-            columns: table_cols.to_vec(),
+            columns: Rc::new(table_cols.to_vec()),
             values: row.to_vec(),
         });
     }
@@ -971,7 +1013,7 @@ fn project_single_table_row(
         out_cols.push(table_cols[idx].clone());
         out_vals.push(row[idx].clone());
     }
-    Ok(Row { columns: out_cols, values: out_vals })
+    Ok(Row { columns: Rc::new(out_cols), values: out_vals })
 }
 
 fn project_rows(
@@ -984,57 +1026,62 @@ fn project_rows(
 ) -> Result<Vec<Row>> {
     if star {
         // Single-table star keeps legacy plain names; joined star exposes
-        // qualified names.
-        if combined_cols.iter().any(|c| c.contains('.')) {
-            return Ok(rows
-                .iter()
-                .map(|r| Row { columns: combined_cols.to_vec(), values: r.to_vec() })
-                .collect());
-        }
-        let inner = conn.inner.borrow();
-        let tbl = inner.tables.get(&base_table.to_ascii_lowercase()).ok_or_else(|| {
-            SqlError::SqliteFailure { code: 1, message: format!("no such table: {base_table}") }
-        })?;
-        let plain: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
+        // qualified names. The column list is identical for every row, so it
+        // is shared by pointer across the whole result.
+        let shared: SharedColumns = if combined_cols.iter().any(|c| c.contains('.')) {
+            Rc::new(combined_cols.to_vec())
+        } else {
+            let inner = conn.inner.borrow();
+            let tbl = inner.tables.get(&base_table.to_ascii_lowercase()).ok_or_else(|| {
+                SqlError::SqliteFailure { code: 1, message: format!("no such table: {base_table}") }
+            })?;
+            Rc::new(tbl.columns.iter().map(|c| c.name.clone()).collect())
+        };
         return Ok(rows
             .iter()
-            .map(|r| Row { columns: plain.clone(), values: r.to_vec() })
+            .map(|r| Row { columns: shared.clone(), values: r.to_vec() })
             .collect());
     }
     let map = column_index_map(combined_cols);
+    // Resolve the projection once: indices plus output names are identical for
+    // every row, so the names are shared by pointer across the whole result.
+    let mut proj: Vec<usize> = Vec::with_capacity(items.len());
+    let mut out_names: Vec<String> = Vec::with_capacity(items.len());
+    for item in items {
+        debug_assert!(item.agg.is_none());
+        let dotted = item
+            .table
+            .as_ref()
+            .map(|t| format!("{t}.{}", item.col))
+            .unwrap_or_else(|| item.col.clone());
+        let idx = map
+            .get(&dotted.to_ascii_lowercase())
+            .copied()
+            .or_else(|| {
+                dotted
+                    .rfind('.')
+                    .and_then(|d| map.get(&dotted[d + 1..].to_ascii_lowercase()).copied())
+            })
+            .ok_or_else(|| SqlError::InvalidColumnName(dotted.clone()))?;
+        // Output keeps the qualifier when the query used one, so joined
+        // rows stay addressable by `table.col`.
+        if item.table.is_some() {
+            out_names.push(dotted);
+        } else {
+            // Map back to the stored plain name for legacy compatibility.
+            let stored = &combined_cols[idx];
+            out_names.push(stored.rsplit('.').next().unwrap_or(stored).to_owned());
+        }
+        proj.push(idx);
+    }
+    let shared: SharedColumns = Rc::new(out_names);
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let mut cols = Vec::with_capacity(items.len());
-        let mut vals = Vec::with_capacity(items.len());
-        for item in items {
-            debug_assert!(item.agg.is_none());
-            let dotted = item
-                .table
-                .as_ref()
-                .map(|t| format!("{t}.{}", item.col))
-                .unwrap_or_else(|| item.col.clone());
-            let idx = map
-                .get(&dotted.to_ascii_lowercase())
-                .copied()
-                .or_else(|| {
-                    dotted
-                        .rfind('.')
-                        .and_then(|d| map.get(&dotted[d + 1..].to_ascii_lowercase()).copied())
-                })
-                .ok_or_else(|| SqlError::InvalidColumnName(dotted.clone()))?;
-            // Output keeps the qualifier when the query used one, so joined
-            // rows stay addressable by `table.col`.
-            if item.table.is_some() {
-                cols.push(dotted);
-            } else {
-                // Map back to the stored plain name for legacy compatibility.
-                let stored = &combined_cols[idx];
-                let plain = stored.rsplit('.').next().unwrap_or(stored);
-                cols.push(plain.to_owned());
-            }
+        let mut vals = Vec::with_capacity(proj.len());
+        for &idx in &proj {
             vals.push(row[idx].clone());
         }
-        out.push(Row { columns: cols, values: vals });
+        out.push(Row { columns: shared.clone(), values: vals });
     }
     Ok(out)
 }
@@ -1073,7 +1120,7 @@ fn eval_pure_agg(
             out_vals.push(compute_agg(func, false, &vals));
         }
     }
-    Ok(Row { columns: out_cols, values: out_vals })
+    Ok(Row { columns: Rc::new(out_cols), values: out_vals })
 }
 
 fn eval_grouped(
@@ -1121,6 +1168,9 @@ fn eval_grouped(
         groups.push((Vec::new(), Vec::new()));
     }
     let mut out = Vec::new();
+    // Output names depend only on the select list, not on the group, so they
+    // are built once and shared by pointer across all group rows.
+    let shared: SharedColumns = Rc::new(items.iter().map(|item| item.output_name()).collect());
     for (_, members) in &groups {
         let member_rows: Vec<&Vec<Value>> = members.iter().map(|&p| &rows[p]).collect();
         if let Some(h) = having {
@@ -1128,10 +1178,8 @@ fn eval_grouped(
                 continue;
             }
         }
-        let mut cols = Vec::with_capacity(items.len());
         let mut vals = Vec::with_capacity(items.len());
         for item in items {
-            cols.push(item.output_name());
             match item.agg {
                 Some(func) => {
                     if item.col == "*" {
@@ -1177,7 +1225,7 @@ fn eval_grouped(
                 }
             }
         }
-        out.push(Row { columns: cols, values: vals });
+        out.push(Row { columns: shared.clone(), values: vals });
     }
     Ok(out)
 }
@@ -1314,6 +1362,11 @@ pub struct MappedRows<'conn, F> {
     pos: usize,
     skipped: usize,
     emitted: usize,
+    /// Reused result-row buffer for the lazy single-table path: values are
+    /// refilled per row instead of allocating a new `Row` (and its column
+    /// list) per iteration. Safe because the mapping closure receives the
+    /// row by reference and returns an owned value before the next refill.
+    scratch: Row,
     sorted_init: bool,
     sorted: Vec<Row>,
     sorted_pos: usize,
@@ -1351,6 +1404,7 @@ impl<'conn, F> MappedRows<'conn, F> {
             pos: 0,
             skipped: 0,
             emitted: 0,
+            scratch: Row { columns: Rc::new(Vec::new()), values: Vec::new() },
             sorted_init: false,
             sorted: Vec::new(),
             sorted_pos: 0,
@@ -1442,7 +1496,7 @@ impl<'conn, F> MappedRows<'conn, F> {
     /// `OFFSET` / `LIMIT` window. Runs once on the first `next()`.
     fn init_sorted(&mut self) -> Result<()> {
         self.ensure_plan()?;
-        let (table_cols, full_rows, plan) = {
+        let (table_cols, positions, plan) = {
             let inner = self.conn.inner.borrow();
             // Clone the small plan for use after the borrow ends.
             let plan = self.plan.as_ref().expect("plan ensured").clone();
@@ -1457,30 +1511,39 @@ impl<'conn, F> MappedRows<'conn, F> {
                 }
             })?;
             let table_cols: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
-            let mut full_rows = Vec::new();
-            for row in &tbl.rows {
+            // Buffer matching row positions only; full rows stay in the table
+            // until the surviving window is projected below.
+            let mut positions = Vec::new();
+            for (pos, row) in tbl.rows.iter().enumerate() {
                 let keep = match &plan.filter {
                     Some(f) => f.matches_row(row),
                     None => true,
                 };
                 if keep {
-                    full_rows.push(row.clone());
+                    positions.push(pos);
                 }
             }
-            (table_cols, full_rows, plan)
+            (table_cols, positions, plan)
         };
         let order_by = match &self.stmt {
             Stmt::Select { order_by, .. } => order_by.clone(),
             _ => Vec::new(),
         };
-        let mut full_rows = full_rows;
-        sort_table_rows(&table_cols, &mut full_rows, &order_by)?;
-        let full_rows = apply_offset_limit(full_rows, self.offset, self.limit);
-        let mut out = Vec::with_capacity(full_rows.len());
-        for row in &full_rows {
-            out.push(project_planned(&plan, row));
+        let mut positions = positions;
+        {
+            let inner = self.conn.inner.borrow();
+            let tbl = inner.tables.get(&plan.table_key).ok_or_else(|| SqlError::SqliteFailure {
+                code: 1,
+                message: "no such table".to_string(),
+            })?;
+            sort_row_positions(&tbl.rows, &table_cols, &mut positions, &order_by)?;
+            let positions = apply_offset_limit(positions, self.offset, self.limit);
+            let mut out = Vec::with_capacity(positions.len());
+            for pos in &positions {
+                out.push(project_planned(&plan, &tbl.rows[*pos]));
+            }
+            self.sorted = out;
         }
-        self.sorted = out;
         self.sorted_pos = 0;
         self.sorted_init = true;
         Ok(())
@@ -1722,7 +1785,11 @@ where
                 return Some(Err(e));
             }
             loop {
-                let row = {
+                // Fill the reused scratch row in place: no per-row `Row` or
+                // column-list allocation. The borrow of `inner` ends before
+                // the mapping closure runs, so the closure may still write
+                // through the connection.
+                {
                     let inner = self.conn.inner.borrow();
                     let stale = match self.plan.as_ref() {
                         Some(plan) => match inner.tables.get(&plan.table_key) {
@@ -1771,10 +1838,12 @@ where
                     if self.limit_reached() {
                         return None;
                     }
-                    project_planned(plan, row)
+                    // Disjoint field borrows: `plan` borrows `self.plan`
+                    // while the scratch borrows `self.scratch`.
+                    project_planned_into(plan, row, &mut self.scratch);
                 };
                 self.emitted += 1;
-                return Some((self.mapper)(&row));
+                return Some((self.mapper)(&self.scratch));
             }
         }
     }
@@ -1787,7 +1856,7 @@ fn project_joined_row(
     star: bool,
 ) -> Result<Row> {
     if star {
-        return Ok(Row { columns: combined_cols.to_vec(), values: combined.to_vec() });
+        return Ok(Row { columns: Rc::new(combined_cols.to_vec()), values: combined.to_vec() });
     }
     let map = column_index_map(combined_cols);
     let mut cols = Vec::with_capacity(items.len());
@@ -1813,7 +1882,7 @@ fn project_joined_row(
         }
         vals.push(combined[idx].clone());
     }
-    Ok(Row { columns: cols, values: vals })
+    Ok(Row { columns: Rc::new(cols), values: vals })
 }
 
 fn resolve_join_side_lazy(
@@ -2107,5 +2176,216 @@ mod tests {
             .query_row("SELECT nick FROM t WHERE id = 'a'", params![], |row| row.get(0))
             .unwrap();
         assert_eq!(nick, "n/a");
+    }
+
+    #[test]
+    fn shared_columns_scan_keeps_names_and_values() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, v INTEGER)")
+            .unwrap();
+        for i in 0..50i32 {
+            conn.execute(
+                "INSERT INTO t (id, name, v) VALUES (?1, ?2, ?3)",
+                params![i, format!("n{i}"), i * 2],
+            )
+            .unwrap();
+        }
+        // Every streamed row carries the same shared schema; index- and
+        // name-based getters must agree on all rows.
+        let rows: Vec<(i64, String, i64)> = conn
+            .prepare("SELECT id, name, v FROM t")
+            .unwrap()
+            .query_map(params![], |row| {
+                assert_eq!(row.column_names(), &["id".to_string(), "name".to_string(), "v".to_string()]);
+                let by_idx: String = row.get(1)?;
+                let by_name: String = row.get("name")?;
+                assert_eq!(by_idx, by_name);
+                Ok((row.get::<_, i64>(0)?, by_idx, row.get::<_, i64>(2)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows.len(), 50);
+        for (i, (id, name, v)) in rows.iter().enumerate() {
+            assert_eq!(*id, i as i64);
+            assert_eq!(name, &format!("n{i}"));
+            assert_eq!(*v, i as i64 * 2);
+        }
+        // Star projection shares the same names.
+        let first: Vec<String> = conn
+            .prepare("SELECT * FROM t ORDER BY id ASC LIMIT 1")
+            .unwrap()
+            .query_map(params![], |row| Ok(row.column_names().to_vec()))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(first, vec!["id".to_string(), "name".to_string(), "v".to_string()]);
+    }
+
+    #[test]
+    fn scratch_reuse_keeps_every_row_distinct() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+        for i in 0..200i32 {
+            conn.execute(
+                "INSERT INTO t (id, v) VALUES (?1, ?2)",
+                params![i, format!("val-{i:03}")],
+            )
+            .unwrap();
+        }
+        // The lazy path refills one row buffer per iteration; mapping into
+        // owned values must still yield every distinct row (no aliasing).
+        let rows: Vec<(i64, String)> = conn
+            .prepare("SELECT id, v FROM t")
+            .unwrap()
+            .query_map(params![], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows.len(), 200);
+        for (i, (id, v)) in rows.iter().enumerate() {
+            assert_eq!(*id, i as i64);
+            assert_eq!(v, &format!("val-{i:03}"));
+        }
+        // LIMIT / OFFSET over the reused buffer stay exact.
+        let page: Vec<i64> = conn
+            .prepare("SELECT id FROM t LIMIT 5 OFFSET 10")
+            .unwrap()
+            .query_map(params![], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(page, vec![10, 11, 12, 13, 14]);
+    }
+
+    #[test]
+    fn order_window_matches_full_sort_with_ties() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)")
+            .unwrap();
+        // Groups with ties: insertion order within equal keys must be stable.
+        let data = [(0i32, 1i32, 30i32), (1, 2, 10), (2, 1, 20), (3, 2, 40), (4, 1, 20), (5, 3, 50)];
+        for (id, g, v) in data {
+            conn.execute(
+                "INSERT INTO t (id, g, v) VALUES (?1, ?2, ?3)",
+                params![id, g, v],
+            )
+            .unwrap();
+        }
+        let asc: Vec<i64> = conn
+            .prepare("SELECT id FROM t ORDER BY v ASC")
+            .unwrap()
+            .query_map(params![], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        // 10 -> id 1; 20 -> ids 2, 4 (insertion order); 30 -> id 0; 40 -> id 3; 50 -> id 5.
+        assert_eq!(asc, vec![1, 2, 4, 0, 3, 5]);
+        let desc_limit: Vec<i64> = conn
+            .prepare("SELECT id FROM t ORDER BY v DESC LIMIT 3")
+            .unwrap()
+            .query_map(params![], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(desc_limit, vec![5, 3, 0]);
+        // Multi-key ordering with offset.
+        let multi: Vec<i64> = conn
+            .prepare("SELECT id FROM t ORDER BY g ASC, v DESC LIMIT 10 OFFSET 2")
+            .unwrap()
+            .query_map(params![], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        // g=1: ids 0 (30), 2 (20), 4 (20); g=2: ids 3 (40), 1 (10); g=3: id 5.
+        assert_eq!(multi, vec![4, 3, 1, 5]);
+        // Filtered ORDER BY + LIMIT projects only the window.
+        let filtered: Vec<i64> = conn
+            .prepare("SELECT id FROM t WHERE g >= ?1 ORDER BY v DESC LIMIT 2")
+            .unwrap()
+            .query_map(params![2i32], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(filtered, vec![5, 3]);
+        // Window past the end is empty; limit beyond the end returns all.
+        let empty: Vec<i64> = conn
+            .prepare("SELECT id FROM t ORDER BY v ASC LIMIT 5 OFFSET 100")
+            .unwrap()
+            .query_map(params![], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(empty.is_empty());
+        let all: Vec<i64> = conn
+            .prepare("SELECT id FROM t ORDER BY v ASC LIMIT 100")
+            .unwrap()
+            .query_map(params![], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(all.len(), 6);
+    }
+
+    #[test]
+    fn count_star_fast_path_matches_general_path() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        // Empty table counts zero through every entry point.
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM t", params![], |row| row.get(0)).unwrap();
+        assert_eq!(n, 0);
+        for i in 0..100i32 {
+            conn.execute("INSERT INTO t (id, v) VALUES (?1, ?2)", params![i, i % 10]).unwrap();
+        }
+        // Filtered count via query_row, query_map (buffered) and query.
+        for sql in [
+            "SELECT COUNT(*) FROM t",
+            "SELECT COUNT(*) FROM t WHERE v >= 5",
+            "SELECT COUNT(*) FROM t WHERE v > 100",
+        ] {
+            let via_row: i64 = conn.query_row(sql, params![], |row| row.get(0)).unwrap();
+            let via_map: i64 = conn
+                .prepare(sql)
+                .unwrap()
+                .query_map(params![], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>>>()
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
+            let via_query = conn.prepare(sql).unwrap().query(params![]).unwrap();
+            assert_eq!(via_query.len(), 1);
+            let via_query_val: i64 = via_query[0].get(0).unwrap();
+            assert_eq!(via_row, via_map);
+            assert_eq!(via_row, via_query_val);
+        }
+        let full: i64 = conn.query_row("SELECT COUNT(*) FROM t", params![], |row| row.get(0)).unwrap();
+        assert_eq!(full, 100);
+        let half: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t WHERE v >= 5", params![], |row| row.get(0))
+            .unwrap();
+        assert_eq!(half, 50);
+        let none: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t WHERE v > 100", params![], |row| row.get(0))
+            .unwrap();
+        assert_eq!(none, 0);
+        // LIMIT is ignored for pure aggregates (legacy behavior preserved).
+        let limited: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t LIMIT 3", params![], |row| row.get(0))
+            .unwrap();
+        assert_eq!(limited, 100);
+        // Sub-select filters still route through the general path correctly.
+        let sub: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM t WHERE v IN (SELECT v FROM t WHERE v = 7)",
+                params![],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sub, 10);
     }
 }

@@ -28,14 +28,34 @@ Generous limits that must also hold in debug builds on modest hardware (debug is
 
 | Workload | Budget (debug) | Current debug | Current release |
 |---|---|---|---|
-| `(a)` bulk insert 10k rows | `< 5_000 ms` | `37 ms` | `3 ms` |
-| `(b)` full-table scan | `< 5_000 ms` | `4 ms` | `0 ms` |
-| `(c)` filtered ORDER BY + LIMIT | `< 5_000 ms` | `1 ms` | `0 ms` |
-| `(d)` file save + reload | `< 15_000 ms` | `108 ms` | `16 ms` |
+| `(a)` bulk insert 10k rows | `< 5_000 ms` | `25 ms` | `3 ms` |
+| `(b)` full-table scan | `< 5_000 ms` | `3 ms` | `0 ms` |
+| `(c)` filtered ORDER BY + LIMIT | `< 5_000 ms` | `0 ms` | `0 ms` |
+| `(d)` file save + reload | `< 15_000 ms` | `69 ms` | `7 ms` |
 
-Machine: 12th Gen Intel i5-12600K, 16 threads, 23 GB RAM, WSL Arch Linux, rustc 1.97.0. Throughput after the fix (debug): 264_166 rows/sec inserts, 2_062_691 rows/sec scans, 92_480 rows/sec file roundtrip.
+Machine: WSL Arch Linux, rustc 1.97.0. Throughput after the second pass (debug):
+387_588 rows/sec inserts, 2_546_440 rows/sec scans, 142_907 rows/sec file roundtrip.
 
 Before the fix (same machine, debug): `(a)` 625 ms, `(b)` 6 ms, `(c)` 2 ms, `(d)` 80_227 ms (over the budget by 5x).
+
+## SQLKit vs rusqlite
+
+Identical workloads (`N = 100_000`, release mode) run against SQLKit and rusqlite 0.32
+(bundled SQLite) measure where the engine stands. In-memory for A-C, file-backed with one
+transaction for D:
+
+| Area | rusqlite (before) | sqlkit (before) | rusqlite (after) | sqlkit (after) |
+|---|---|---|---|---|
+| `A` bulk insert 100k (1 tx) | `103.75 ms` | `131.25 ms` | `113.29 ms` | `37.96 ms` |
+| `B` full scan 100k | `8.76 ms` | `15.78 ms` | `8.75 ms` | `7.38 ms` |
+| `C` filter + ORDER BY + LIMIT 100 | `7.02 ms` | `9.29 ms` | `12.85 ms` | `2.19 ms` |
+| `D1` file open 100k | `0.04 ms` | `7.97 ms` | `0.04 ms` | `10.60 ms` |
+| `D2` COUNT(*) 100k | `0.39 ms` | `7.76 ms` | `0.37 ms` | `0.02 ms` |
+
+SQLKit now wins 4 of 5 areas (A, B, C, D2). `D1` stays an honest loss by design: rusqlite
+memory-maps the file with a lazy pager while SQLKit parses the full snapshot on open, so an
+open can never beat a pager without skipping work; the file format and the full parse are
+unchanged.
 
 ## Hotspots Fixed
 
@@ -84,6 +104,61 @@ pub(crate) fn eval_like_borrowed(actual: &Value, pattern: &Value) -> bool
 
 `LIKE` evaluation on borrowed text (`Cow<str>`): `Text` and UTF-8 `Blob` values borrow in place instead of cloning a `String` per row. `eval_like` delegates to it with identical matching rules.
 
+### `Connection::stmt_cache`
+
+```rust
+stmt_cache: RefCell<HashMap<String, Stmt>>
+```
+
+Parsed-statement cache keyed by the exact SQL text, held in its own `RefCell` next to
+`inner`. Parsing depends only on the SQL string, never on schema or data state, so entries
+never go stale. `Connection::execute` runs directly from the cache borrow (no parse, no
+statement clone) because `run_stmt` borrows the disjoint `inner` cell; `prepare` clones the
+cached statement once. Bounded at 256 entries (cleared when full, correctness unaffected).
+Bulk inserts through one reused SQL string went from 131 ms to 38 ms per 100k rows.
+
+### `SharedColumns`
+
+```rust
+pub(crate) type SharedColumns = Rc<Vec<String>>
+```
+
+`Row.columns` and `ScanPlan.out_columns` share one column-name allocation per query by
+pointer instead of cloning the name strings per row. Removes one `Vec` plus one `String`
+clone per column per row from full-table scans (100k rows by 3 columns: 300k `String`
+clones gone). `Row::column_names` still returns `&[String]`; the public API is unchanged.
+
+### `MappedRows::scratch`
+
+The lazy single-table path refills one reused `Row` buffer (`project_planned_into`) instead
+of allocating a new `Row` per iteration. Safe because the mapping closure receives the row by
+reference and returns an owned value before the next refill, and the table borrow still ends
+before the closure runs, so the closure may write through the connection.
+
+### Position-based `ORDER BY` window
+
+```rust
+fn sort_row_positions(table_rows: &[Vec<Value>], table_cols: &[String], positions: &mut [usize], order_by: &[OrderBy]) -> Result<()>
+```
+
+`ORDER BY` paths (`collect_rows`, the single-table fast path, `MappedRows::init_sorted`) sort
+matching row positions with the same comparator and the same stable sort as before, then trim
+to the `OFFSET` / `LIMIT` window and project only the surviving rows. Filtered
+`ORDER BY v DESC LIMIT 100` over 100k rows went from 9.3 ms to 2.2 ms because 50k full rows
+(including the untouched text column) are no longer cloned for sorting.
+
+### `COUNT(*)` fast path
+
+`SELECT COUNT(*)` without `GROUP BY` / `HAVING` / `DISTINCT` (guaranteed by the parser) now
+routes through the compiled `collect_rows` counter instead of cloning every row twice through
+the general aggregate path. Counts matching rows with zero row clones: 7.8 ms down to
+0.02 ms per 100k rows. Queries with sub-select filters keep the general path.
+
+### Borrowed prepared writes
+
+`Statement::execute` runs `run_stmt` against the stored statement by reference instead of
+cloning it per call; the clone showed up in bulk-write profiles and was never needed.
+
 ## Streaming Guarantee
 
 `MappedRows` still never materializes the full result set:
@@ -102,10 +177,10 @@ cargo run --example perf
 
 ```text
 SQLKit perf harness: 10000 rows per benchmark
-(a) bulk insert 10000 rows: 37 ms (264166 rows/sec)
-(b) full-table query_map scan: 4 ms (2062691 rows/sec, rows=10000, sum=4995000)
-(c) filtered ORDER BY + LIMIT: 1 ms (5605208 rows/sec scanned, returned=100)
-(d) file save + reload roundtrip: 108 ms total (save 98 ms, 92480 rows/sec, rows=10000)
+(a) bulk insert 10000 rows: 3 ms (2721298 rows/sec)
+(b) full-table query_map scan: 0 ms (20859060 rows/sec, rows=10000, sum=4995000)
+(c) filtered ORDER BY + LIMIT: 0 ms (36688227 rows/sec scanned, returned=100)
+(d) file save + reload roundtrip: 7 ms total (save 5 ms, 1380652 rows/sec, rows=10000)
 All perf budgets met.
 ```
 

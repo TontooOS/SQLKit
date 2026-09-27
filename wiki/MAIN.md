@@ -61,6 +61,7 @@ milestone 2 work. Triggers and views are follow-up items. See
 
 ## Changelog
 
+- 2026-09-27: Performance pass 2: per-connection parsed-statement cache, shared column storage, scratch row reuse, position-based ORDER BY window projection, COUNT(*) fast path, borrow-based prepared writes; SQLKit now beats rusqlite 0.32 in 4 of 5 identical-workload areas (file open stays an honest pager loss); 7 new regression tests; documented in Performance.md.
 - 2026-09-27: B-Tree pager milestone 1: `src/btree.rs` reads foreign SQLite files (header, table pages, records, overflow chains, schema discovery, 256 MiB guard); `Connection::open` loads them, writes keep the snapshot format; covered by `tests/foreign_read.rs` (500 rows, JOIN, GROUP BY).
 - 2026-09-27: Performance pass: added `examples/perf.rs` harness with budgets, PK lookup cache, deferred transaction snapshots, compiled scan plans, borrow-based LIKE; documented in Performance.md.
 - 2026-09-27: Initial wiki created with all 7 feature pages.

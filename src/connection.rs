@@ -99,7 +99,18 @@ impl PkKey {
 /// CoreData: `open`, `execute`, `execute_batch`, `prepare`, `transaction`.
 pub struct Connection {
     pub(crate) inner: RefCell<Inner>,
+    /// Parsed-statement cache keyed by the exact SQL text. Parsing depends
+    /// only on the SQL string, never on schema or data state, so entries
+    /// never go stale. Kept in its own `RefCell` (not inside `Inner`) so
+    /// `execute` can run directly from the cache borrow while `run_stmt`
+    /// mutably borrows `inner`. Bounded by [`STMT_CACHE_CAP`].
+    stmt_cache: RefCell<HashMap<String, Stmt>>,
 }
+
+/// Maximum statements held by [`Connection::stmt_cache`]. When the cache is
+/// full it is cleared before inserting; correctness is unaffected because the
+/// cache only avoids re-parsing (a miss simply parses again).
+const STMT_CACHE_CAP: usize = 256;
 
 impl Connection {
     fn fresh(path: Option<PathBuf>) -> Self {
@@ -115,6 +126,7 @@ impl Connection {
                 backup: None,
                 pk_cache: HashMap::new(),
             }),
+            stmt_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -154,14 +166,58 @@ impl Connection {
     }
 
     /// Execute a single statement with bound parameters.
+    ///
+    /// The SQL text is parsed once per distinct string and then served from
+    /// the per-connection statement cache; repeated calls (for example bulk
+    /// inserts through one reused SQL string) skip tokenizing and parsing
+    /// entirely and run straight from the cached statement.
     pub fn execute(&self, sql: &str, params: impl IntoParams) -> Result<usize> {
         let bound = params.into_params()?;
+        // Fast path: run directly from the cache borrow (no parse, no clone).
+        // `run_stmt` borrows `inner`, a different `RefCell`, so holding the
+        // cache borrow across the call is sound; `run_stmt` never touches the
+        // cache and never runs user code.
+        let cached = self.stmt_cache.borrow();
+        if let Some(stmt) = cached.get(sql) {
+            let changes = self.run_stmt(stmt, &bound)?;
+            let write = is_write(stmt);
+            drop(cached);
+            if write {
+                self.persist_if_needed()?;
+            }
+            return Ok(changes);
+        }
+        drop(cached);
         let stmt = parser::parse_one(sql)?;
         let changes = self.run_stmt(&stmt, &bound)?;
-        if is_write(&stmt) {
+        let write = is_write(&stmt);
+        self.insert_cached(sql, stmt);
+        if write {
             self.persist_if_needed()?;
         }
         Ok(changes)
+    }
+
+    /// Insert a freshly parsed statement into the cache, clearing the cache
+    /// first when it reached [`STMT_CACHE_CAP`]. Callers must have parsed the
+    /// statement from `sql`, so the key always matches the value.
+    fn insert_cached(&self, sql: &str, stmt: Stmt) {
+        let mut cache = self.stmt_cache.borrow_mut();
+        if cache.len() >= STMT_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(sql.to_owned(), stmt);
+    }
+
+    /// Parse one statement through the cache, returning an owned copy for
+    /// `prepare` / `query_row`. Cache misses parse and populate the cache.
+    fn parse_cached(&self, sql: &str) -> Result<Stmt> {
+        if let Some(stmt) = self.stmt_cache.borrow().get(sql) {
+            return Ok(stmt.clone());
+        }
+        let stmt = parser::parse_one(sql)?;
+        self.insert_cached(sql, stmt.clone());
+        Ok(stmt)
     }
 
     /// Run several statements without parameters (also accepts PRAGMA /
@@ -177,7 +233,7 @@ impl Connection {
 
     /// Prepare a statement for repeated execution.
     pub fn prepare(&self, sql: &str) -> Result<Statement<'_>> {
-        let stmt = parser::parse_one(sql)?;
+        let stmt = self.parse_cached(sql)?;
         Ok(Statement::new(self, stmt))
     }
 
@@ -709,6 +765,75 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         let v: i64 = conn.query_row("SELECT v FROM t WHERE id = ?1", crate::params!["a"], |row| row.get(0)).unwrap();
         assert_eq!(v, 1);
+    }
+
+    #[test]
+    fn statement_cache_reuses_parses_across_executes() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+        // Same SQL text three times with different bindings: each call must
+        // run (cache hits after the first parse) with its own parameters.
+        for i in 0..3i32 {
+            conn.execute(
+                "INSERT INTO t (id, v) VALUES (?1, ?2)",
+                crate::params![i, format!("v{i}")],
+            )
+            .unwrap();
+        }
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM t", (), |row| row.get(0)).unwrap();
+        assert_eq!(n, 3);
+        // Cached statements stay usable through `prepare` and `query_row`.
+        let v: String = conn
+            .query_row("SELECT v FROM t WHERE id = ?1", crate::params![1i32], |row| row.get(0))
+            .unwrap();
+        assert_eq!(v, "v1");
+        let mut stmt = conn.prepare("INSERT INTO t (id, v) VALUES (?1, ?2)").unwrap();
+        stmt.execute(crate::params![9i32, "nine"]).unwrap();
+        let v: String = conn
+            .query_row("SELECT v FROM t WHERE id = ?1", crate::params![9i32], |row| row.get(0))
+            .unwrap();
+        assert_eq!(v, "nine");
+    }
+
+    #[test]
+    fn statement_cache_evicts_without_losing_correctness() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Push far more distinct statements than the cache holds so the
+        // eviction path runs; every statement must still execute correctly
+        // and evicted statements must re-parse on reuse.
+        for i in 0..300i32 {
+            conn.execute_batch(&format!("CREATE TABLE evict_{i} (id INTEGER PRIMARY KEY)")).unwrap();
+        }
+        for i in 0..300i32 {
+            conn.execute(
+                &format!("INSERT INTO evict_{i} (id) VALUES (?1)"),
+                crate::params![i],
+            )
+            .unwrap();
+        }
+        for i in 0..300i32 {
+            let v: i64 = conn
+                .query_row(&format!("SELECT id FROM evict_{i}"), (), |row| row.get(0))
+                .unwrap();
+            assert_eq!(v, i as i64);
+        }
+        // The earliest statement still works after eviction.
+        conn.execute("INSERT INTO evict_0 (id) VALUES (?1)", crate::params![999i32]).unwrap();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM evict_0", (), |row| row.get(0)).unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn statement_cache_does_not_poison_on_parse_errors() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(conn.execute("INSERT INTO", ()).is_err());
+        // A failed parse leaves the cache clean: valid SQL works afterwards
+        // and the same invalid SQL keeps failing deterministically.
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
+        conn.execute("INSERT INTO t (id) VALUES (?1)", crate::params![1i32]).unwrap();
+        assert!(conn.execute("INSERT INTO", ()).is_err());
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM t", (), |row| row.get(0)).unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]
