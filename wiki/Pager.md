@@ -25,14 +25,47 @@ conn.execute_batch("CREATE TABLE t (id TEXT PRIMARY KEY)").unwrap();
 conn.close().unwrap();
 ```
 
+## Read Path
+
+`src/btree.rs` implements the milestone 1 read path for foreign SQLite
+files (databases written by other SQLite implementations, e.g. the SQLite
+CLI or CPython `sqlite3`):
+
+| Input | Handling |
+|---|---|
+| `100`-byte header | Page size (`1` means `65536`) and text encoding (`UTF-8` / `UTF-16LE` / `UTF-16BE`) |
+| `Table` pages | Leaf (`0x0D`) and interior (`0x05`) pages, traversed via the cell-pointer array |
+| `Leaf` cells | `rowid` plus record payload (serial types `0`-`9`, `TEXT` / `BLOB` with file encoding, `INTEGER` widths, `FLOAT`, constants `0` / `1`) |
+| `Overflow` chains | Payloads larger than one page are reassembled page by page |
+| `Rowid` lookup | Interior-page descent to a single `rowid` (`btree::find_rowid`) |
+| `Schema` | Page 1 yields `sqlite_master`; user-table `CREATE TABLE` statements are parsed with the existing parser (`ColumnDef`), with a lenient fallback for sized types and table constraints |
+
+`INTEGER PRIMARY KEY` columns aliasing the `rowid` are filled from the
+cell `rowid` when the record stores `NULL`; short records are padded with
+column defaults (SQLite `ALTER TABLE` semantics). Index pages (`0x02` /
+`0x0A`) carry no table rows and are skipped during scans. `sqlite_%`
+internal tables are skipped. `WITHOUT ROWID` tables are rejected with
+`Err(SqlError::Unsupported)`. Files larger than 256 MiB are refused with
+`Err(SqlError::Unsupported)` as a denial-of-service guard.
+
+```rust
+let conn = Connection::open("/tmp/other.sqlite").unwrap();
+let n: i64 = conn.query_row("SELECT COUNT(*) FROM users", (), |row| row.get(0)).unwrap();
+```
+
 ## Foreign-File Policy
 
 `Connection::open` validates the 100-byte header first:
 
 - Missing magic returns `Err(SqlError::NotSqliteFile)`.
-- Valid magic without the `TSQL01` marker returns `Err(SqlError::Unsupported)` instead of misreading foreign B-Tree pages.
+- Valid magic with the `TSQL01` marker loads the snapshot below.
+- Valid magic without the marker is read as a foreign SQLite B-Tree file
+  (read path above): all user-table rows are loaded into the in-memory
+  engine.
 
-> **Note:** Full interop with SQLite files written by rusqlite or the SQLite CLI is roadmap work for the pager subagent, not part of the basis.
+> **Note:** Foreign files are read-only input. The first write persists the
+> in-memory tables in the snapshot format, replacing the foreign layout.
+> Native B-Tree writes are milestone 2 work.
 
 ## Usage / Example
 

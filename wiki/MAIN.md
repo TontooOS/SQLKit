@@ -50,14 +50,17 @@ See [Connection.md](Connection.md) for details.
 ## Scope and Roadmap
 
 Basis engine implements `CREATE TABLE`, `CREATE INDEX`, `INSERT` with
-`OR REPLACE` and `OR IGNORE`, `SELECT` with `WHERE col = ?` filters,
-`UPDATE`, `DELETE`, `PRAGMA`, and transactions. JOIN, sub-selects,
-aggregates, triggers, views, and the full B-Tree page layout are follow-up
-items. Foreign SQLite B-Tree files are detected and rejected with
-`Unsupported` until the pager subagent lands. See [Pager.md](Pager.md)
-and [Parser.md](Parser.md) for the exact limits.
+`OR REPLACE` and `OR IGNORE`, `SELECT` with `WHERE` filters, `JOIN`,
+sub-selects, aggregates, `GROUP BY` / `HAVING`, `DISTINCT`, `UNION`,
+`ORDER BY`, `LIMIT` / `OFFSET`, `UPDATE`, `DELETE`, `PRAGMA`, and
+transactions. Foreign SQLite B-Tree files are readable (milestone 1 read
+path: header, table pages, records, overflow chains, schema discovery);
+writes always persist the snapshot format, and native B-Tree writes are
+milestone 2 work. Triggers and views are follow-up items. See
+[Pager.md](Pager.md) and [Parser.md](Parser.md) for the exact limits.
 
 ## Changelog
 
+- 2026-09-27: B-Tree pager milestone 1: `src/btree.rs` reads foreign SQLite files (header, table pages, records, overflow chains, schema discovery, 256 MiB guard); `Connection::open` loads them, writes keep the snapshot format; covered by `tests/foreign_read.rs` (500 rows, JOIN, GROUP BY).
 - 2026-09-27: Performance pass: added `examples/perf.rs` harness with budgets, PK lookup cache, deferred transaction snapshots, compiled scan plans, borrow-based LIKE; documented in Performance.md.
 - 2026-09-27: Initial wiki created with all 7 feature pages.

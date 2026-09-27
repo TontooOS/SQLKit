@@ -126,17 +126,10 @@ impl Connection {
             pager::create_new(&path)?;
             return Ok(conn);
         }
-        match pager::load(&path) {
-            Ok(tables) => {
-                let conn = Self::fresh(Some(path));
-                conn.inner.borrow_mut().tables = tables;
-                Ok(conn)
-            }
-            Err(SqlError::Unsupported(_)) => Err(SqlError::unsupported(
-                "foreign SQLite B-Tree file detected; full pager interop is roadmap (see wiki/Pager.md)",
-            )),
-            Err(other) => Err(other),
-        }
+        let tables = pager::load(&path)?;
+        let conn = Self::fresh(Some(path));
+        conn.inner.borrow_mut().tables = tables;
+        Ok(conn)
     }
 
     /// Open a transient in-memory database.

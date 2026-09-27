@@ -21,6 +21,7 @@
 //! assert_eq!(title, "Hello");
 //! ```
 
+pub mod btree;
 pub mod connection;
 pub mod error;
 pub mod ffi;

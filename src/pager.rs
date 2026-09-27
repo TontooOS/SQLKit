@@ -1,10 +1,12 @@
 //! File pager: SQLite header handling plus atomic snapshot persistence.
 //!
-//! Basis scope: every database file starts with a real 100-byte SQLite
-//! header (`SQLite format 3\0`, page size 4096), followed by the marker
-//! `TSQL01` and a JSON snapshot of tables. This keeps files recognizable
-//! as SQLite, validates foreign files instead of corrupting them, and
-//! leaves the full B-Tree page layout to the pager follow-up subagent.
+//! Basis scope: every database file SQLKit creates starts with a real
+//! 100-byte SQLite header (`SQLite format 3\0`, page size 4096), followed by
+//! the marker `TSQL01` and a JSON snapshot of tables. This keeps files
+//! recognizable as SQLite and validates foreign files instead of corrupting
+//! them. Foreign SQLite B-Tree files are readable through the milestone 1
+//! read path (see [`crate::btree`]); native B-Tree writes are milestone 2
+//! work and writes keep persisting the snapshot format below.
 //!
 //! I/O is streaming-oriented: rows are serialized incrementally and the
 //! file is replaced atomically (temp file + rename + fsync), so readers
@@ -61,8 +63,9 @@ pub fn validate(path: &Path) -> Result<u32> {
     parse_header(&header)
 }
 
-/// Load tables from a snapshot file. Foreign SQLite files without the
-/// SQLKit marker return `Unsupported` instead of being misread.
+/// Load tables from a snapshot file. Files without the SQLKit marker are
+/// read as foreign SQLite B-Tree files via [`crate::btree`]; files larger
+/// than 256 MiB are refused with `Unsupported`.
 pub fn load(path: &Path) -> Result<HashMap<String, Table>> {
     validate(path)?;
     let file = File::open(path)?;
@@ -70,15 +73,9 @@ pub fn load(path: &Path) -> Result<HashMap<String, Table>> {
     let mut header = [0u8; HEADER_LEN];
     reader.read_exact(&mut header)?;
     let mut marker = [0u8; 6];
-    if reader.read_exact(&mut marker).is_err() {
-        return Err(SqlError::unsupported(
-            "foreign SQLite B-Tree layout without SQLKit snapshot (pager subagent pending)",
-        ));
-    }
-    if &marker != SQLKIT_MARKER {
-        return Err(SqlError::unsupported(
-            "foreign SQLite B-Tree layout without SQLKit snapshot (pager subagent pending)",
-        ));
+    if reader.read_exact(&mut marker).is_err() || &marker != SQLKIT_MARKER {
+        drop(reader);
+        return crate::btree::load_foreign(path);
     }
     let mut version_bytes = [0u8; 4];
     reader.read_exact(&mut version_bytes)?;
