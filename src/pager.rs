@@ -95,15 +95,17 @@ pub fn load(path: &Path) -> Result<HashMap<String, Table>> {
 /// + JSON). Kept for migration tests and for readers that still produce
 /// snapshots; production writes use the native B-Tree path in
 /// [`crate::btree_write::persist_native`].
+///
+/// Sidecar handling matches the native path: unique temp name, `O_EXCL`
+/// creation, owner-only permissions, symlinks refused.
 pub fn save(path: &Path, tables: &HashMap<String, Table>) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
         }
     }
-    let tmp = path.with_extension("tsql-tmp");
+    let (tmp, file) = crate::btree_write::create_unique_tmp_for(path)?;
     {
-        let file = File::create(&tmp)?;
         let mut writer = BufWriter::new(file);
         writer.write_all(&build_header())?;
         writer.write_all(SQLKIT_MARKER)?;
@@ -113,18 +115,8 @@ pub fn save(path: &Path, tables: &HashMap<String, Table>) -> Result<()> {
         let file = writer.into_inner().map_err(|e| SqlError::Io(e.into_error()))?;
         file.sync_all()?;
     }
+    crate::btree_write::refuse_symlink_for(path)?;
     fs::rename(&tmp, path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = fs::metadata(path) {
-            let mut perms = meta.permissions();
-            if perms.mode() & 0o777 == 0 {
-                perms.set_mode(0o600);
-                let _ = fs::set_permissions(path, perms);
-            }
-        }
-    }
     Ok(())
 }
 

@@ -20,6 +20,7 @@ Dependency-light SQLite-compatible engine for TontooOS with a ruslite-compatible
 | Transaction | [Transaction.md](Transaction.md) | RAII transactions with commit and rollback |
 | FFI | [FFI.md](FFI.md) | C header and memory rules |
 | Performance | [Performance.md](Performance.md) | Benchmark method, budgets, and hotspot fixes |
+| Security | [Security.md](Security.md) | Threat model, input bounds, filesystem and FFI rules |
 
 ## Quick Start
 
@@ -63,6 +64,7 @@ views are follow-up items. See [Pager.md](Pager.md) and
 
 ## Changelog
 
+- 2026-09-27: Security pass: enforced statement/batch/chain/parameter bounds, fixed char-boundary panic in schema splitting, checked rowid/key casts, O_EXCL unique temp files with 0600-at-creation, journal symlink refusal, streaming journal/recovery, FFI panic boundary (-4), error-echo truncation; `tests/security.rs` (17 tests); documented in Security.md.
 - 2026-09-27: B-Tree pager milestone 2 (NATIVE WRITE): `src/btree_write.rs` rebuilds real SQLite files on every commit (records, overflow, leaf/interior splits with root promotion, `sqlite_master`, schema cookie, freelist trunk, rollback journal with recovery, WAL refusal, snapshot migration); `tests/native_write.rs` proves rusqlite interop both directions (500 rows, reverse edits, crash recovery, freelist, cookie); documented in Pager.md.
 - 2026-09-27: Performance pass 2: per-connection parsed-statement cache, shared column storage, scratch row reuse, position-based ORDER BY window projection, COUNT(*) fast path, borrow-based prepared writes; SQLKit now beats rusqlite 0.32 in 4 of 5 identical-workload areas (file open stays an honest pager loss); 7 new regression tests; documented in Performance.md.
 - 2026-09-27: B-Tree pager milestone 1: `src/btree.rs` reads foreign SQLite files (header, table pages, records, overflow chains, schema discovery, 256 MiB guard); `Connection::open` loads them, writes keep the snapshot format; covered by `tests/foreign_read.rs` (500 rows, JOIN, GROUP BY).

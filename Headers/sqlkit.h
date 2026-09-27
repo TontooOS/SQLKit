@@ -37,7 +37,8 @@ SQLKitConnection *sqlkit_open_memory(void);
  *
  * @param db Connection handle
  * @param sql Single SQL statement
- * @return Rows changed, or negative on error
+ * @return Rows changed, or negative on error (-1 null handle, -2 bad SQL
+ *         string, -3 execution error, -4 internal failure)
  */
 int64_t sqlkit_exec(SQLKitConnection *db, const char *sql);
 
@@ -46,7 +47,8 @@ int64_t sqlkit_exec(SQLKitConnection *db, const char *sql);
  *
  * @param db Connection handle
  * @param sql One or more SQL statements
- * @return 0 on success, negative on error
+ * @return 0 on success, negative on error (-4 covers internal failures;
+ *         panics never cross into C)
  */
 int sqlkit_exec_batch(SQLKitConnection *db, const char *sql);
 

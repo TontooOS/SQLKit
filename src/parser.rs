@@ -6,10 +6,26 @@
 //! The full SQLite grammar (JOIN, sub-selects, triggers, views, ...) is an
 //! explicit roadmap item for follow-up subagents.
 
-use crate::error::{Result, SqlError};
+use crate::error::{Result, SqlError, redact};
 use crate::value::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
+
+/// Maximum bytes of a single SQL statement text (1 MiB, SQLite-style
+/// `SQLITE_LIMIT_SQL_LENGTH` denial-of-service guard).
+pub const MAX_STATEMENT_BYTES: usize = 1_048_576;
+/// Maximum bytes of a whole `execute_batch` text (bounds transient splitter
+/// memory; single statements inside are still capped by
+/// [`MAX_STATEMENT_BYTES`]).
+pub const MAX_BATCH_BYTES: usize = 8 * 1_048_576;
+/// Maximum statements accepted by one `execute_batch` call.
+pub const MAX_BATCH_STATEMENTS: usize = 10_000;
+/// Maximum nesting depth for `AND` / `OR` / `HAVING` chains, `UNION` chains
+/// and nested sub-selects (bounds parser and evaluator stack usage).
+pub const MAX_NESTING_DEPTH: usize = 128;
+/// Maximum bound parameters (`?`, `?N`, `:name`, `@name`) per statement,
+/// matching the SQLite default `SQLITE_LIMIT_VARIABLE_NUMBER`.
+pub const MAX_PARAMS: usize = 999;
 
 /// A literal or bound parameter inside a statement.
 #[derive(Clone, Debug, PartialEq)]
@@ -753,7 +769,7 @@ pub enum Stmt {
     Rollback,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum Token {
     Word(String),
     Integer(i64),
@@ -774,6 +790,34 @@ enum Token {
     RParen,
     Star,
     Dot,
+}
+
+impl std::fmt::Debug for Token {
+    /// Debug rendering with untrusted payloads redacted past 128 characters,
+    /// so parse errors embedding tokens never echo secrets or huge literals.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Token::Word(s) => write!(f, "Word({})", redact(s)),
+            Token::Text(s) => write!(f, "Text({})", redact(s)),
+            Token::Named(s) => write!(f, "Named({})", redact(s)),
+            Token::Integer(v) => write!(f, "Integer({v})"),
+            Token::Real(v) => write!(f, "Real({v})"),
+            Token::Placeholder(n) => write!(f, "Placeholder({n})"),
+            Token::Question => write!(f, "Question"),
+            Token::Eq => write!(f, "Eq"),
+            Token::NotEq => write!(f, "NotEq"),
+            Token::Less => write!(f, "Less"),
+            Token::LessEq => write!(f, "LessEq"),
+            Token::Greater => write!(f, "Greater"),
+            Token::GreaterEq => write!(f, "GreaterEq"),
+            Token::Comma => write!(f, "Comma"),
+            Token::Semi => write!(f, "Semi"),
+            Token::LParen => write!(f, "LParen"),
+            Token::RParen => write!(f, "RParen"),
+            Token::Star => write!(f, "Star"),
+            Token::Dot => write!(f, "Dot"),
+        }
+    }
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>> {
@@ -947,14 +991,62 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
     Ok(tokens)
 }
 
+/// Register one anonymous (`?`, `:name`, `@name`) placeholder. Fails with a
+/// parse error past [`MAX_PARAMS`] so crafted statements cannot exhaust
+/// memory through parameter bookkeeping.
+fn register_placeholder(counter: &mut usize) -> Result<usize> {
+    *counter = counter
+        .checked_add(1)
+        .ok_or_else(|| SqlError::parse("too many bound parameters"))?;
+    if *counter > MAX_PARAMS {
+        return Err(SqlError::parse(format!(
+            "too many bound parameters: at most {MAX_PARAMS} per statement"
+        )));
+    }
+    Ok(*counter)
+}
+
+/// Register one numbered (`?N`) placeholder.
+fn register_numbered(counter: &mut usize, n: usize) -> Result<()> {
+    if n == 0 || n > MAX_PARAMS {
+        return Err(SqlError::parse(format!(
+            "placeholder number out of range: at most {MAX_PARAMS} per statement"
+        )));
+    }
+    *counter = (*counter).max(n);
+    Ok(())
+}
+
+/// Reject overlong `AND` / `OR` / `HAVING` / `UNION` chains past
+/// [`MAX_NESTING_DEPTH`] so crafted statements cannot exhaust the stack in
+/// the parser or the evaluator.
+fn check_chain_len(len: usize, kind: &str) -> Result<()> {
+    if len > MAX_NESTING_DEPTH {
+        return Err(SqlError::parse(format!(
+            "{kind} chain too long: at most {MAX_NESTING_DEPTH} elements"
+        )));
+    }
+    Ok(())
+}
+
+/// Depth of nested `UNION` nodes (1 for a plain `SELECT`).
+fn union_depth(stmt: &Stmt) -> usize {
+    match stmt {
+        Stmt::Union { left, .. } => union_depth(left) + 1,
+        _ => 1,
+    }
+}
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Current sub-select nesting depth (bounds stack usage on crafted input).
+    depth: usize,
 }
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self { tokens, pos: 0, depth: 0 }
     }
 
     fn peek(&self) -> Option<&Token> {
@@ -988,20 +1080,14 @@ impl Parser {
 
     fn parse_expr(&mut self, placeholder_counter: &mut usize) -> Result<Expr> {
         match self.next() {
-            Some(Token::Question) => {
-                *placeholder_counter += 1;
-                Ok(Expr::Placeholder(*placeholder_counter))
-            }
+            Some(Token::Question) => Ok(Expr::Placeholder(register_placeholder(placeholder_counter)?)),
             Some(Token::Placeholder(n)) => {
-                *placeholder_counter = (*placeholder_counter).max(n);
+                register_numbered(placeholder_counter, n)?;
                 Ok(Expr::Placeholder(n))
             }
             // Named parameters (`:name`, `@name`) bind by position in order
             // of appearance, exactly like `?`.
-            Some(Token::Named(_)) => {
-                *placeholder_counter += 1;
-                Ok(Expr::Placeholder(*placeholder_counter))
-            }
+            Some(Token::Named(_)) => Ok(Expr::Placeholder(register_placeholder(placeholder_counter)?)),
             Some(Token::Integer(v)) => Ok(Expr::Literal(Value::Integer(v))),
             Some(Token::Real(v)) => Ok(Expr::Literal(Value::Real(v))),
             Some(Token::Text(s)) => Ok(Expr::Literal(Value::Text(s))),
@@ -1025,8 +1111,11 @@ impl Parser {
         let mut items = vec![self.parse_and(placeholder_counter)?];
         while self.eat_word("OR") {
             items.push(self.parse_and(placeholder_counter)?);
+            check_chain_len(items.len(), "OR")?;
         }
         if items.len() == 1 {
+            // SAFETY: `items` holds exactly one element (checked above);
+            // `next()` on a one-element vec always yields `Some`.
             Ok(items.into_iter().next().unwrap())
         } else {
             Ok(WhereClause::Or(items))
@@ -1037,8 +1126,10 @@ impl Parser {
         let mut items = vec![self.parse_condition(placeholder_counter)?];
         while self.eat_word("AND") {
             items.push(self.parse_condition(placeholder_counter)?);
+            check_chain_len(items.len(), "AND")?;
         }
         if items.len() == 1 {
+            // SAFETY: `items` holds exactly one element (checked above).
             Ok(items.into_iter().next().unwrap())
         } else {
             Ok(WhereClause::And(items))
@@ -1072,13 +1163,31 @@ impl Parser {
     }
 
     fn parse_subselect(&mut self, placeholder_counter: &mut usize) -> Result<Box<Stmt>> {
+        if self.depth >= MAX_NESTING_DEPTH {
+            return Err(SqlError::parse(format!(
+                "sub-select nesting too deep: at most {MAX_NESTING_DEPTH} levels"
+            )));
+        }
+        self.depth += 1;
+        let result = self.parse_subselect_inner(placeholder_counter);
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_subselect_inner(
+        &mut self,
+        placeholder_counter: &mut usize,
+    ) -> Result<Box<Stmt>> {
         match self.next() {
             Some(Token::LParen) => {}
             other => return Err(SqlError::parse(format!("expected '(' before sub-select, got {other:?}"))),
         }
         let select_word = self.expect_word()?;
         if !select_word.eq_ignore_ascii_case("SELECT") {
-            return Err(SqlError::parse(format!("expected SELECT in sub-select, got {select_word}")));
+            return Err(SqlError::parse(format!(
+                "expected SELECT in sub-select, got {}",
+                redact(&select_word)
+            )));
         }
         let stmt = self.parse_select_body(&select_word, placeholder_counter)?;
         // Sub-selects may themselves be UNIONs.
@@ -1213,6 +1322,8 @@ impl Parser {
             if AggFunc::parse(&w).is_some()
                 && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
             {
+                // SAFETY: `AggFunc::parse(&w)` returned `Some` two lines above
+                // with the same `w`; pure function, same result.
                 let func = AggFunc::parse(&w).expect("checked above");
                 self.pos += 1; // FUNC
                 self.pos += 1; // (
@@ -1288,6 +1399,7 @@ impl Parser {
             }
             let right = self.parse_column_ref()?;
             joins.push(JoinClause { kind, table, left, right });
+            check_chain_len(joins.len(), "JOIN")?;
         }
         Ok(joins)
     }
@@ -1303,6 +1415,7 @@ impl Parser {
         let mut cols = Vec::new();
         loop {
             cols.push(self.parse_dotted_name()?);
+            check_chain_len(cols.len(), "GROUP BY")?;
             if matches!(self.peek(), Some(Token::Comma)) {
                 self.pos += 1;
                 continue;
@@ -1326,8 +1439,10 @@ impl Parser {
         let mut items = vec![self.parse_having_and(placeholder_counter)?];
         while self.eat_word("OR") {
             items.push(self.parse_having_and(placeholder_counter)?);
+            check_chain_len(items.len(), "HAVING OR")?;
         }
         if items.len() == 1 {
+            // SAFETY: `items` holds exactly one element (checked above).
             Ok(items.into_iter().next().unwrap())
         } else {
             Ok(HavingClause::Or(items))
@@ -1338,8 +1453,10 @@ impl Parser {
         let mut items = vec![self.parse_having_cond(placeholder_counter)?];
         while self.eat_word("AND") {
             items.push(self.parse_having_cond(placeholder_counter)?);
+            check_chain_len(items.len(), "HAVING AND")?;
         }
         if items.len() == 1 {
+            // SAFETY: `items` holds exactly one element (checked above).
             Ok(items.into_iter().next().unwrap())
         } else {
             Ok(HavingClause::And(items))
@@ -1352,6 +1469,8 @@ impl Parser {
             if AggFunc::parse(&w).is_some()
                 && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
             {
+                // SAFETY: `AggFunc::parse(&w)` returned `Some` two lines above
+                // with the same `w`; pure function, same result.
                 let func = AggFunc::parse(&w).expect("checked above");
                 self.pos += 1;
                 self.pos += 1;
@@ -1497,6 +1616,7 @@ impl Parser {
                 return Err(SqlError::parse(format!("expected SELECT after UNION, got {select_word}")));
             }
             let right = self.parse_select_body(&select_word, placeholder_counter)?;
+            check_chain_len(union_depth(&acc) + 1, "UNION")?;
             acc = Stmt::Union {
                 left: Box::new(acc),
                 right: Box::new(right),
@@ -1851,6 +1971,7 @@ pub fn split_batch(sql: &str) -> Vec<String> {
         if c == '\'' {
             if in_single && chars.peek() == Some(&'\'') {
                 current.push('\'');
+                // SAFETY: peeked `Some` on the same iterator above.
                 current.push(chars.next().unwrap());
                 continue;
             }
@@ -1875,6 +1996,11 @@ pub fn split_batch(sql: &str) -> Vec<String> {
 
 /// Parse exactly one statement; errors with `MultipleStatement` on batches.
 pub fn parse_one(sql: &str) -> Result<Stmt> {
+    if sql.len() > MAX_STATEMENT_BYTES {
+        return Err(SqlError::parse(format!(
+            "statement too long: at most {MAX_STATEMENT_BYTES} bytes"
+        )));
+    }
     let parts = split_batch(sql);
     if parts.is_empty() {
         return Err(SqlError::parse("empty statement"));
@@ -1893,8 +2019,18 @@ pub fn parse_one(sql: &str) -> Result<Stmt> {
 
 /// Parse a batch of statements (used by `execute_batch`).
 pub fn parse_batch(sql: &str) -> Result<Vec<Stmt>> {
+    if sql.len() > MAX_BATCH_BYTES {
+        return Err(SqlError::parse(format!(
+            "batch too long: at most {MAX_BATCH_BYTES} bytes"
+        )));
+    }
     let mut out = Vec::new();
     for part in split_batch(sql) {
+        if out.len() >= MAX_BATCH_STATEMENTS {
+            return Err(SqlError::parse(format!(
+                "too many statements: at most {MAX_BATCH_STATEMENTS} per batch"
+            )));
+        }
         let tokens = tokenize(&part)?;
         let mut parser = Parser::new(tokens);
         out.push(parser.parse_stmt()?);

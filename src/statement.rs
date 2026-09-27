@@ -1499,7 +1499,11 @@ impl<'conn, F> MappedRows<'conn, F> {
         let (table_cols, positions, plan) = {
             let inner = self.conn.inner.borrow();
             // Clone the small plan for use after the borrow ends.
-            let plan = self.plan.as_ref().expect("plan ensured").clone();
+            let plan = self
+                .plan
+                .as_ref()
+                .ok_or_else(|| SqlError::Custom("scan plan missing after ensure".into()))?
+                .clone();
             let table_name = match &self.stmt {
                 Stmt::Select { table, .. } => table.clone(),
                 _ => String::new(),
@@ -1805,7 +1809,14 @@ where
                             Err(e) => return Some(Err(e)),
                         }
                     }
-                    let plan = self.plan.as_ref().expect("plan ensured");
+                    let plan = match self.plan.as_ref() {
+                        Some(plan) => plan,
+                        None => {
+                            return Some(Err(SqlError::Custom(
+                                "scan plan missing after ensure".into(),
+                            )))
+                        }
+                    };
                     let table_name = match &self.stmt {
                         Stmt::Select { table, .. } => table.clone(),
                         _ => String::new(),

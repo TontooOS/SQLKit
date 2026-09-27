@@ -46,6 +46,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Page size of every file written by SQLKit (milestone 2).
 pub const NATIVE_PAGE_SIZE: u32 = 4096;
@@ -1135,6 +1136,90 @@ fn fsync_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Secure sidecar-file creation.
+// ---------------------------------------------------------------------------
+
+/// Counter for process-unique temp-file names.
+fn tmp_counter() -> &'static AtomicU64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    &COUNTER
+}
+
+/// Refuse symlinked sidecars: an attacker-prepared symlink at a tmp or
+/// journal path would otherwise redirect a truncate or become a rename
+/// target outside the database directory.
+fn refuse_symlink(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(SqlError::custom(format!(
+            "refusing to use symlinked sidecar file at {}",
+            path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(SqlError::Io(e)),
+    }
+}
+
+/// `OpenOptions` with owner-only permissions applied AT CREATION time, so
+/// database bytes are never briefly world-readable before a later chmod.
+fn secure_options() -> std::fs::OpenOptions {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts
+}
+
+/// Create a uniquely named temp file next to `path` with `O_EXCL` semantics
+/// (`create_new`): a pre-existing file or symlink is never truncated or
+/// followed. Retries with a fresh counter on (unlikely) name collision.
+fn create_unique_tmp(path: &Path) -> Result<(PathBuf, File)> {
+    let pid = std::process::id();
+    for _ in 0..100 {
+        let n = tmp_counter().fetch_add(1, Ordering::Relaxed);
+        let mut name = path.as_os_str().to_owned();
+        name.push(format!(".{pid}.{n}.sqlkit-tmp"));
+        let tmp = PathBuf::from(name);
+        refuse_symlink(&tmp)?;
+        let mut opts = secure_options();
+        match opts.create_new(true).open(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(SqlError::Io(e)),
+        }
+    }
+    Err(SqlError::custom(format!(
+        "could not create unique temp file next to {}",
+        path.display()
+    )))
+}
+
+/// Create (or truncate) the fixed-name rollback journal. The name must stay
+/// `<db>-journal` so crash recovery finds it; symlinks are refused and the
+/// file is created owner-only.
+fn create_journal_file(journal: &Path) -> Result<File> {
+    refuse_symlink(journal)?;
+    let mut opts = secure_options();
+    opts.create(true).truncate(true).open(journal).map_err(SqlError::Io)
+}
+
+/// `create_unique_tmp` for the legacy snapshot path in [`crate::pager`].
+/// Kept crate-visible so both persist paths share one hardened helper.
+#[doc(hidden)]
+pub fn create_unique_tmp_for(path: &Path) -> Result<(PathBuf, File)> {
+    create_unique_tmp(path)
+}
+
+/// `refuse_symlink` for the legacy snapshot path in [`crate::pager`].
+#[doc(hidden)]
+pub fn refuse_symlink_for(path: &Path) -> Result<()> {
+    refuse_symlink(path)
+}
+
 /// Refuse to open a database with uncheckpointed WAL frames. SQLKit is a
 /// rollback-journal engine and never replays `-wal` content, so reading the
 /// main file would silently return stale rows. Callers surface `Unsupported`.
@@ -1189,12 +1274,40 @@ pub fn recover_if_needed(path: &Path) -> Result<bool> {
             journal.display()
         )));
     }
-    let original = &raw[12..];
+    drop(raw);
+    // Stream the original content back: journals can be hundreds of
+    // megabytes, so the payload is copied in chunks through a temp file
+    // (atomic rename) instead of loading it into RAM.
+    let (tmp, mut out) = create_unique_tmp(path)?;
     {
-        let mut file = File::create(path)?;
-        file.write_all(original)?;
-        file.flush()?;
-        fsync_file(&file)?;
+        use std::io::Read;
+        let mut src = File::open(&journal)?;
+        let mut header = [0u8; 12];
+        let mut filled = 0usize;
+        while filled < header.len() {
+            match src.read(&mut header[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) => return Err(SqlError::Io(e)),
+            }
+        }
+        let mut chunk = [0u8; 65536];
+        loop {
+            match src.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => out.write_all(&chunk[..n]).map_err(SqlError::Io)?,
+                Err(e) => return Err(SqlError::Io(e)),
+            }
+        }
+        out.flush().map_err(SqlError::Io)?;
+        fsync_file(&out)?;
+    }
+    drop(out);
+    fsync_parent(&tmp)?;
+    refuse_symlink(path)?;
+    fs::rename(&tmp, path)?;
+    if let Ok(file) = File::open(path) {
+        let _ = file.sync_all();
     }
     fsync_parent(path)?;
     fs::remove_file(&journal)?;
@@ -1202,36 +1315,52 @@ pub fn recover_if_needed(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-fn read_old_file(path: &Path) -> Result<Option<Vec<u8>>> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(SqlError::Io(e)),
+/// Previous-file metadata for [`persist_native`]: total length plus the
+/// first bytes (cookie, counter and snapshot detection need no more).
+/// The full previous content is streamed into the journal on demand, so
+/// multi-hundred-megabyte files never load into RAM here.
+fn read_old_meta(path: &Path) -> Result<Option<(u64, Vec<u8>)>> {
+    let total = match fs::metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(SqlError::Io(e)),
+        Ok(meta) => meta.len(),
+    };
+    use std::io::Read;
+    let mut file = File::open(path)?;
+    let mut prefix = [0u8; 128];
+    let mut filled = 0usize;
+    while filled < prefix.len() {
+        match file.read(&mut prefix[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) => return Err(SqlError::Io(e)),
+        }
     }
+    Ok(Some((total, prefix[..filled].to_vec())))
 }
 
-fn old_page_count(raw: &[u8]) -> u32 {
-    if is_snapshot_bytes(raw) || raw.len() < 100 {
+fn old_page_count(total_len: u64, prefix: &[u8]) -> u32 {
+    if is_snapshot_bytes(prefix) || (prefix.len() < 100 && total_len < 100) {
         return 0;
     }
     // Only trust the count when the file is really paged at 4096 bytes.
-    if raw.len() % NATIVE_PAGE_SIZE as usize != 0 {
+    if total_len % u64::from(NATIVE_PAGE_SIZE) != 0 {
         return 0;
     }
-    match crate::btree::parse_file_header(&raw[0..100.min(raw.len())]) {
+    match crate::btree::parse_file_header(&prefix[0..100.min(prefix.len())]) {
         Ok(header) if header.page_size == NATIVE_PAGE_SIZE => {
-            (raw.len() as u32) / NATIVE_PAGE_SIZE
+            u32::try_from(total_len / u64::from(NATIVE_PAGE_SIZE)).unwrap_or(u32::MAX)
         }
         _ => 0,
     }
 }
 
-fn old_cookie_and_counter(raw: &[u8]) -> (u32, u32) {
-    if raw.len() < 100 || is_snapshot_bytes(raw) {
+fn old_cookie_and_counter(prefix: &[u8]) -> (u32, u32) {
+    if prefix.len() < 100 || is_snapshot_bytes(prefix) {
         return (1, 0);
     }
-    let cookie = u32::from_be_bytes([raw[40], raw[41], raw[42], raw[43]]);
-    let counter = u32::from_be_bytes([raw[24], raw[25], raw[26], raw[27]]);
+    let cookie = u32::from_be_bytes([prefix[40], prefix[41], prefix[42], prefix[43]]);
+    let counter = u32::from_be_bytes([prefix[24], prefix[25], prefix[26], prefix[27]]);
     (cookie.max(1), counter)
 }
 
@@ -1290,9 +1419,11 @@ pub fn persist_native(
             fs::create_dir_all(parent)?;
         }
     }
-    let old = read_old_file(path)?;
-    let (base_cookie, base_counter) =
-        old.as_ref().map(|raw| old_cookie_and_counter(raw)).unwrap_or((1, 0));
+    let old = read_old_meta(path)?;
+    let (base_cookie, base_counter) = old
+        .as_ref()
+        .map(|(_, prefix)| old_cookie_and_counter(prefix))
+        .unwrap_or((1, 0));
     let cookie = if state.schema_dirty {
         base_cookie.wrapping_add(1).max(1)
     } else if old.is_none() {
@@ -1301,7 +1432,10 @@ pub fn persist_native(
         base_cookie
     };
     let counter = base_counter.wrapping_add(1).max(1);
-    let old_pages = old.as_ref().map(|raw| old_page_count(raw)).unwrap_or(0);
+    let old_pages = old
+        .as_ref()
+        .map(|(total, prefix)| old_page_count(*total, prefix))
+        .unwrap_or(0);
 
     // Assemble builder inputs in a deterministic order.
     let mut table_inputs = Vec::with_capacity(tables.len());
@@ -1362,14 +1496,26 @@ pub fn persist_native(
         old_page_count: old_pages,
     })?;
 
-    // Rollback journal first: copy of the previous content, then fsync.
-    if let Some(previous) = &old {
+    // Rollback journal first: stream the previous content in chunks (never
+    // fully into RAM), then fsync. Owner-only file, symlinks refused.
+    if old.is_some() {
         let journal = journal_path(path);
         {
-            let mut file = File::create(&journal)?;
+            let mut file = create_journal_file(&journal)?;
             file.write_all(JOURNAL_MAGIC)?;
             file.write_all(&JOURNAL_VERSION.to_be_bytes())?;
-            file.write_all(previous)?;
+            {
+                use std::io::Read;
+                let mut src = File::open(path)?;
+                let mut chunk = [0u8; 65536];
+                loop {
+                    match src.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => file.write_all(&chunk[..n])?,
+                        Err(e) => return Err(SqlError::Io(e)),
+                    }
+                }
+            }
             file.flush()?;
             fsync_file(&file)?;
         }
@@ -1377,14 +1523,17 @@ pub fn persist_native(
         crash_here(path, "after_journal")?;
     }
 
-    // Atomic image replacement in the same directory.
-    let tmp = path.with_extension("sqlkit-tmp");
+    // Atomic image replacement in the same directory (unique temp name,
+    // O_EXCL creation, owner-only permissions).
+    let (tmp, mut file) = create_unique_tmp(path)?;
     {
-        let mut file = File::create(&tmp)?;
         file.write_all(&image)?;
         file.flush()?;
         fsync_file(&file)?;
     }
+    drop(file);
+    fsync_parent(&tmp)?;
+    refuse_symlink(path)?;
     fs::rename(&tmp, path)?;
     // Re-sync the file and the directory so the rename is durable, then
     // delete the journal (commit record) and sync the directory again.
@@ -1400,7 +1549,8 @@ pub fn persist_native(
     Ok(PersistOutcome {
         schema_cookie: cookie,
         change_counter: counter,
-        page_count: image.len() as u32 / NATIVE_PAGE_SIZE,
+        page_count: u32::try_from(image.len() as u64 / u64::from(NATIVE_PAGE_SIZE))
+            .unwrap_or(u32::MAX),
     })
 }
 
@@ -1444,7 +1594,7 @@ pub fn synthesize_rowids(table: &Table, alias: Option<usize>) -> Vec<i64> {
                     ids.push(*v);
                 }
                 _ => {
-                    max += 1;
+                    max = max.saturating_add(1);
                     ids.push(max);
                 }
             }
@@ -1457,7 +1607,7 @@ pub fn synthesize_rowids(table: &Table, alias: Option<usize>) -> Vec<i64> {
         let _ = running;
     } else {
         for _ in &table.rows {
-            max += 1;
+            max = max.saturating_add(1);
             ids.push(max);
         }
     }

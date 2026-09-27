@@ -78,5 +78,22 @@ impl SqlError {
     }
 }
 
+/// Maximum characters of untrusted text echoed inside an error message.
+///
+/// Longer values are cut off with a `...[truncated]` suffix so error paths
+/// never leak secrets or blow up logs with megabytes of echoed input.
+pub const MAX_ERROR_ECHO_CHARS: usize = 128;
+
+/// Shorten untrusted text for error messages. Short inputs pass through
+/// unchanged; anything longer is cut to [`MAX_ERROR_ECHO_CHARS`] characters.
+pub(crate) fn redact(text: &str) -> String {
+    if text.chars().count() <= MAX_ERROR_ECHO_CHARS {
+        text.to_owned()
+    } else {
+        let short: String = text.chars().take(MAX_ERROR_ECHO_CHARS).collect();
+        format!("{short}...[truncated]")
+    }
+}
+
 /// Common result type for SQLKit.
 pub type Result<T> = std::result::Result<T, SqlError>;

@@ -245,7 +245,7 @@ impl Connection {
             // Defensive repair: rowid vectors always parallel the rows.
             let keys: Vec<String> = inner.tables.keys().cloned().collect();
             for key in keys {
-                let table = inner.tables.get(&key).expect("key just collected");
+                let table = inner.tables.get(&key).ok_or_else(|| missing_table(&key))?;
                 let ok = inner.rowids.get(&key).map(|ids| ids.len() == table.rows.len()).unwrap_or(false);
                 if !ok {
                     let alias = crate::btree_write::rowid_alias_of(&table.columns);
@@ -529,7 +529,7 @@ impl Connection {
                 // Defaults for missing columns: existing rows and new inserts
                 // use the column default when present, otherwise NULL.
                 let defaults: Vec<Value> = {
-                    let tbl = inner.tables.get(&key).expect("table checked above");
+                    let tbl = inner.tables.get(&key).ok_or_else(|| missing_table(&key))?;
                     tbl.columns.iter().map(|c| c.default.clone().unwrap_or(Value::Null)).collect()
                 };
                 for exprs in rows {
@@ -550,7 +550,7 @@ impl Connection {
                 // auto-assigned (and filled into the row, SQLite style),
                 // every other row takes the next free rowid.
                 let alias = {
-                    let tbl = inner.tables.get(&key).expect("table checked above");
+                    let tbl = inner.tables.get(&key).ok_or_else(|| missing_table(&key))?;
                     crate::btree_write::rowid_alias_of(&tbl.columns)
                 };
                 let mut next = inner
@@ -624,7 +624,7 @@ impl Connection {
                                 inner
                                     .tables
                                     .get_mut(&key)
-                                    .expect("table checked above")
+                                    .ok_or_else(|| missing_table(&key))?
                                     .rows[pos] = row;
                                 changed += 1;
                             } else if *or_ignore {
@@ -638,7 +638,7 @@ impl Connection {
                         } else {
                             let pos = {
                                 let tbl =
-                                    inner.tables.get_mut(&key).expect("table checked above");
+                                    inner.tables.get_mut(&key).ok_or_else(|| missing_table(&key))?;
                                 let pos = tbl.rows.len();
                                 tbl.rows.push(row);
                                 pos
@@ -651,7 +651,7 @@ impl Connection {
                             inner
                                 .pk_cache
                                 .get_mut(&key)
-                                .expect("cache just built")
+                                .ok_or_else(|| missing_table(&key))?
                                 .insert(lookup, pos);
                             changed += 1;
                         }
@@ -659,7 +659,7 @@ impl Connection {
                 } else {
                     let count = staged.len();
                     {
-                        let tbl = inner.tables.get_mut(&key).expect("table checked above");
+                        let tbl = inner.tables.get_mut(&key).ok_or_else(|| missing_table(&key))?;
                         tbl.rows.extend(staged);
                     }
                     inner.rowids.entry(key.clone()).or_default().extend(new_ids);
@@ -736,11 +736,11 @@ impl Connection {
                 };
                 let mut changed = 0;
                 let alias = {
-                    let tbl = inner.tables.get(&key).expect("table checked above");
+                    let tbl = inner.tables.get(&key).ok_or_else(|| missing_table(&key))?;
                     crate::btree_write::rowid_alias_of(&tbl.columns)
                 };
                 {
-                    let tbl = inner.tables.get_mut(&key).expect("table checked above");
+                    let tbl = inner.tables.get_mut(&key).ok_or_else(|| missing_table(&key))?;
                     for row in tbl.rows.iter_mut() {
                         let keep = match &compiled {
                             Some(f) => f.matches_row(row),
@@ -761,7 +761,7 @@ impl Connection {
                     let values: Vec<Value> = inner
                         .tables
                         .get(&key)
-                        .expect("table checked above")
+                        .ok_or_else(|| missing_table(&key))?
                         .rows
                         .iter()
                         .map(|row| row[pos].clone())
@@ -795,7 +795,7 @@ impl Connection {
                         }
                     }
                     {
-                        let tbl = inner.tables.get_mut(&key).expect("table checked above");
+                        let tbl = inner.tables.get_mut(&key).ok_or_else(|| missing_table(&key))?;
                         for (row, fill) in tbl.rows.iter_mut().zip(fills.iter()) {
                             if let Some(id) = fill {
                                 row[pos] = Value::Integer(*id);
@@ -826,12 +826,12 @@ impl Connection {
                         .map(|f| f.compile(&map, bound))
                         .transpose()?
                 };
-                let before = inner.tables.get(&key).expect("table checked above").rows.len();
+                let before = inner.tables.get(&key).ok_or_else(|| missing_table(&key))?.rows.len();
                 let old_ids = inner.rowids.get(&key).cloned().unwrap_or_default();
                 let mut kept = Vec::with_capacity(before);
                 let mut kept_ids = Vec::with_capacity(before);
                 {
-                    let tbl = inner.tables.get_mut(&key).expect("table checked above");
+                    let tbl = inner.tables.get_mut(&key).ok_or_else(|| missing_table(&key))?;
                     for (row, id) in tbl.rows.drain(..).zip(old_ids.into_iter().chain(std::iter::repeat(0))).take(before) {
                         let remove = match &compiled {
                             Some(f) => f.matches_row(&row),
@@ -849,7 +849,7 @@ impl Connection {
                 // surviving rows travel with them.
                 inner.rowids.insert(key.clone(), kept_ids);
                 inner.pk_cache.remove(&key);
-                let changed = before - inner.tables.get(&key).expect("table checked above").rows.len();
+                let changed = before - inner.tables.get(&key).ok_or_else(|| missing_table(&key))?.rows.len();
                 inner.changes = changed;
                 Ok(changed)
             }
@@ -903,6 +903,14 @@ impl Connection {
         inner.changes = 0;
         Ok(())
     }
+}
+
+/// Internal invariant failure: the table key was validated against
+/// `inner.tables` earlier in the same borrow, so this is unreachable unless
+/// a future refactor breaks the check-then-use order. Returned as an error
+/// (never a panic) so crafted input can never crash the process.
+fn missing_table(key: &str) -> SqlError {
+    SqlError::SqliteFailure { code: 1, message: format!("no such table: {key}") }
 }
 
 pub(crate) fn resolve_expr(expr: &Expr, bound: &[Value]) -> Result<Value> {

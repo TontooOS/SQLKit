@@ -147,14 +147,16 @@ pub fn parse_file_header(header: &[u8]) -> Result<FileHeader> {
 }
 
 /// Bytes of a signed big-endian integer of width 1, 2, 3, 4, 6 or 8.
-fn read_signed_be(bytes: &[u8]) -> i64 {
-    debug_assert!(!bytes.is_empty() && bytes.len() <= 8);
+fn read_signed_be(bytes: &[u8]) -> Result<i64> {
+    if bytes.is_empty() || bytes.len() > 8 {
+        return Err(corrupt("integer width out of range"));
+    }
     let mut raw: u64 = 0;
     for byte in bytes {
         raw = (raw << 8) | u64::from(*byte);
     }
     let shift = 64 - bytes.len() * 8;
-    ((raw << shift) as i64) >> shift
+    Ok(((raw << shift) as i64) >> shift)
 }
 
 fn decode_utf16(bytes: &[u8], big_endian: bool) -> String {
@@ -200,37 +202,37 @@ pub fn parse_record(payload: &[u8], encoding: TextEncoding) -> Result<Vec<Value>
                 let end = body.checked_add(1).ok_or_else(|| corrupt("record overflows"))?;
                 let bytes = payload.get(body..end).ok_or_else(|| corrupt("truncated integer"))?;
                 body = end;
-                Value::Integer(read_signed_be(bytes))
+                Value::Integer(read_signed_be(bytes)?)
             }
             2 => {
                 let end = body.checked_add(2).ok_or_else(|| corrupt("record overflows"))?;
                 let bytes = payload.get(body..end).ok_or_else(|| corrupt("truncated integer"))?;
                 body = end;
-                Value::Integer(read_signed_be(bytes))
+                Value::Integer(read_signed_be(bytes)?)
             }
             3 => {
                 let end = body.checked_add(3).ok_or_else(|| corrupt("record overflows"))?;
                 let bytes = payload.get(body..end).ok_or_else(|| corrupt("truncated integer"))?;
                 body = end;
-                Value::Integer(read_signed_be(bytes))
+                Value::Integer(read_signed_be(bytes)?)
             }
             4 => {
                 let end = body.checked_add(4).ok_or_else(|| corrupt("record overflows"))?;
                 let bytes = payload.get(body..end).ok_or_else(|| corrupt("truncated integer"))?;
                 body = end;
-                Value::Integer(read_signed_be(bytes))
+                Value::Integer(read_signed_be(bytes)?)
             }
             5 => {
                 let end = body.checked_add(6).ok_or_else(|| corrupt("record overflows"))?;
                 let bytes = payload.get(body..end).ok_or_else(|| corrupt("truncated integer"))?;
                 body = end;
-                Value::Integer(read_signed_be(bytes))
+                Value::Integer(read_signed_be(bytes)?)
             }
             6 => {
                 let end = body.checked_add(8).ok_or_else(|| corrupt("record overflows"))?;
                 let bytes = payload.get(body..end).ok_or_else(|| corrupt("truncated integer"))?;
                 body = end;
-                Value::Integer(read_signed_be(bytes))
+                Value::Integer(read_signed_be(bytes)?)
             }
             7 => {
                 let end = body.checked_add(8).ok_or_else(|| corrupt("record overflows"))?;
@@ -386,7 +388,7 @@ impl Image {
             decode_varint(tail).ok_or_else(|| corrupt("truncated leaf cell"))?;
         let (rowid_raw, rowid_used) = decode_varint(&tail[used..])
             .ok_or_else(|| corrupt("truncated leaf cell rowid"))?;
-        let rowid = rowid_raw as i64;
+        let rowid = i64::try_from(rowid_raw).map_err(|_| corrupt("rowid out of range"))?;
         if payload_len > self.data.len() as u64 {
             return Err(corrupt("cell payload larger than file"));
         }
@@ -504,7 +506,8 @@ impl Image {
                         let child = u32::from_be_bytes([tail[0], tail[1], tail[2], tail[3]]);
                         let (key, _) = decode_varint(&tail[4..])
                             .ok_or_else(|| corrupt("truncated interior key"))?;
-                        if target <= key as i64 {
+                        let key = i64::try_from(key).map_err(|_| corrupt("key out of range"))?;
+                        if target <= key {
                             next = Some(child);
                             break;
                         }
@@ -534,33 +537,31 @@ struct SchemaEntry {
 }
 
 /// Split the column list of a `CREATE TABLE` body on top-level commas,
-/// respecting nesting and quoted identifiers.
+/// respecting nesting and quoted identifiers. Tracks BYTE offsets (not char
+/// indices) so non-ASCII schema text can never split a char boundary.
 fn split_column_list(body: &str) -> Vec<String> {
     let mut items = Vec::new();
     let mut depth = 0usize;
     let mut start = 0usize;
     let mut quote: Option<char> = None;
     let mut bracket = false;
-    let chars: Vec<char> = body.chars().collect();
-    let mut i = 0usize;
-    while i < chars.len() {
-        let c = chars[i];
+    let mut iter = body.char_indices().peekable();
+    while let Some((byte_idx, c)) = iter.next() {
         if let Some(q) = quote {
             if c == q {
-                if q == '\'' && chars.get(i + 1) == Some(&'\'') {
-                    i += 2;
+                // `''` inside a single-quoted literal is an escaped quote.
+                if q == '\'' && matches!(iter.peek(), Some((_, '\''))) {
+                    iter.next();
                     continue;
                 }
                 quote = None;
             }
-            i += 1;
             continue;
         }
         if bracket {
             if c == ']' {
                 bracket = false;
             }
-            i += 1;
             continue;
         }
         match c {
@@ -569,12 +570,11 @@ fn split_column_list(body: &str) -> Vec<String> {
             '(' => depth += 1,
             ')' => depth = depth.saturating_sub(1),
             ',' if depth == 0 => {
-                items.push(body[start..i].to_string());
-                start = i + 1;
+                items.push(body[start..byte_idx].to_string());
+                start = byte_idx + c.len_utf8();
             }
             _ => {}
         }
-        i += 1;
     }
     items.push(body[start..].to_string());
     items
@@ -798,7 +798,7 @@ fn lenient_create_table(sql: &str) -> Result<Vec<ColumnDef>> {
             '[' => bracket = true,
             '(' => depth += 1,
             ')' => {
-                depth -= 1;
+                depth = depth.saturating_sub(1);
                 if depth == 0 {
                     close = Some(open + index);
                     break;
@@ -919,8 +919,14 @@ fn discover_schemas(image: &Image, stats: &mut ForeignStats) -> Result<Vec<Schem
             continue;
         }
         let rootpage = match record.get(3) {
-            Some(crate::value::Value::Integer(value)) => *value as u32,
-            Some(crate::value::Value::Real(value)) => *value as u32,
+            Some(crate::value::Value::Integer(value)) => u32::try_from(*value)
+                .map_err(|_| corrupt("bad rootpage in sqlite_master"))?,
+            Some(crate::value::Value::Real(value)) => {
+                if !value.is_finite() || *value < 0.0 || *value > u32::MAX as f64 {
+                    return Err(corrupt("bad rootpage in sqlite_master"));
+                }
+                *value as u32
+            }
             Some(crate::value::Value::Text(value)) => {
                 value.parse::<u32>().map_err(|_| corrupt("bad rootpage in sqlite_master"))?
             }
@@ -1078,8 +1084,14 @@ pub fn load_foreign_detailed(path: &Path) -> Result<ForeignDatabase> {
                 continue;
             }
             let rootpage = match record.get(3) {
-                Some(crate::value::Value::Integer(value)) => *value as u32,
-                Some(crate::value::Value::Real(value)) => *value as u32,
+                Some(crate::value::Value::Integer(value)) => u32::try_from(*value)
+                .map_err(|_| corrupt("bad rootpage in sqlite_master"))?,
+                Some(crate::value::Value::Real(value)) => {
+                if !value.is_finite() || *value < 0.0 || *value > u32::MAX as f64 {
+                    return Err(corrupt("bad rootpage in sqlite_master"));
+                }
+                *value as u32
+            }
                 Some(crate::value::Value::Text(value)) => value
                     .parse::<u32>()
                     .map_err(|_| corrupt("bad rootpage in sqlite_master"))?,

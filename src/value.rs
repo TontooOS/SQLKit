@@ -165,7 +165,7 @@ impl FromValue for i32 {
             Value::Real(v) => Ok(*v as i32),
             Value::Text(s) => s
                 .parse()
-                .map_err(|_| SqlError::FromSqlConversionFailure(format!("not an i32: {s}"))),
+                .map_err(|_| SqlError::FromSqlConversionFailure(format!("not an i32: {}", crate::error::redact(s)))),
             Value::Null => Err(SqlError::FromSqlConversionFailure("NULL is not i32".into())),
             Value::Blob(_) => Err(SqlError::FromSqlConversionFailure("BLOB is not i32".into())),
         }
@@ -179,7 +179,7 @@ impl FromValue for i64 {
             Value::Real(v) => Ok(*v as i64),
             Value::Text(s) => s
                 .parse()
-                .map_err(|_| SqlError::FromSqlConversionFailure(format!("not an i64: {s}"))),
+                .map_err(|_| SqlError::FromSqlConversionFailure(format!("not an i64: {}", crate::error::redact(s)))),
             Value::Null => Err(SqlError::FromSqlConversionFailure("NULL is not i64".into())),
             Value::Blob(_) => Err(SqlError::FromSqlConversionFailure("BLOB is not i64".into())),
         }
@@ -193,7 +193,7 @@ impl FromValue for f64 {
             Value::Integer(v) => Ok(*v as f64),
             Value::Text(s) => s
                 .parse()
-                .map_err(|_| SqlError::FromSqlConversionFailure(format!("not an f64: {s}"))),
+                .map_err(|_| SqlError::FromSqlConversionFailure(format!("not an f64: {}", crate::error::redact(s)))),
             Value::Null => Err(SqlError::FromSqlConversionFailure("NULL is not f64".into())),
             Value::Blob(_) => Err(SqlError::FromSqlConversionFailure("BLOB is not f64".into())),
         }
@@ -208,7 +208,7 @@ impl FromValue for bool {
             Value::Text(s) => match s.as_str() {
                 "1" | "true" | "TRUE" => Ok(true),
                 "0" | "false" | "FALSE" => Ok(false),
-                _ => Err(SqlError::FromSqlConversionFailure(format!("not a bool: {s}"))),
+                _ => Err(SqlError::FromSqlConversionFailure(format!("not a bool: {}", crate::error::redact(s)))),
             },
             Value::Null => Err(SqlError::FromSqlConversionFailure("NULL is not bool".into())),
             Value::Blob(_) => Err(SqlError::FromSqlConversionFailure("BLOB is not bool".into())),
@@ -298,6 +298,11 @@ impl_into_params_tuple!(A, B, C, D, E, F);
 
 /// Build a `Vec<Value>` from Rust values, like `rusqlite::params!`.
 ///
+/// Conversion failures panic: all built-in `ToSql` implementations are
+/// infallible, so a panic here means a caller-provided custom `ToSql`
+/// returned `Err`. Custom implementations used with `params!` must be
+/// infallible (return `Ok` always) or the caller must build `Vec<Value>`
+/// by hand to propagate the error.
 /// ```rust
 /// use sqlkit::{params, Value};
 /// let p = params![1i32, "hello", vec![1u8, 2u8]];
