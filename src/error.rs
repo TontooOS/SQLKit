@@ -95,5 +95,32 @@ pub(crate) fn redact(text: &str) -> String {
     }
 }
 
+/// Compatibility helper mirroring `rusqlite::OptionalExtension`: converts
+/// `QueryReturnedNoRows` into `Ok(None)` for optional single-row lookups.
+///
+/// ```rust
+/// use sqlkit::{params, Connection, OptionalExtension};
+/// let conn = Connection::open_in_memory().unwrap();
+/// conn.execute_batch("CREATE TABLE t (id TEXT PRIMARY KEY)").unwrap();
+/// let hit: Option<String> = conn
+///     .query_row("SELECT id FROM t WHERE id = ?1", params!["x"], |row| row.get(0))
+///     .optional()
+///     .unwrap();
+/// assert_eq!(hit, None);
+/// ```
+pub trait OptionalExtension<T> {
+    fn optional(self) -> Result<Option<T>>;
+}
+
+impl<T> OptionalExtension<T> for Result<T> {
+    fn optional(self) -> Result<Option<T>> {
+        match self {
+            Ok(value) => Ok(Some(value)),
+            Err(SqlError::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 /// Common result type for SQLKit.
 pub type Result<T> = std::result::Result<T, SqlError>;

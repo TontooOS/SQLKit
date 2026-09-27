@@ -34,7 +34,7 @@ pub mod transaction;
 pub mod value;
 
 pub use connection::{Column, Connection, Table};
-pub use error::{Result, SqlError};
+pub use error::{OptionalExtension, Result, SqlError};
 pub use statement::{ColumnIndex, MappedRows, Row, Statement};
 pub use transaction::Transaction;
 pub use value::{FromValue, IntoParams, ToSql, Value};
@@ -50,7 +50,7 @@ pub const SQLKIT_VERSION_STR: &str = "26.1.0";
 /// Convenience prelude mirroring the ruslite items CoreData uses.
 pub mod prelude {
     pub use crate::connection::Connection;
-    pub use crate::error::{Result, SqlError};
+    pub use crate::error::{OptionalExtension, Result, SqlError};
     pub use crate::statement::{Row, Statement};
     pub use crate::transaction::Transaction;
     pub use crate::value::{FromValue, IntoParams, ToSql, Value};
@@ -60,6 +60,13 @@ pub mod prelude {
 #[cfg(test)]
 mod integration_tests {
     use crate::{params, Connection};
+
+    #[test]
+    fn connection_is_send_for_coredata() {
+        // `PersistentStore: Send` in CoreData holds a `Connection`.
+        fn assert_send<T: Send>() {}
+        assert_send::<Connection>();
+    }
 
     fn coredata_schema(conn: &Connection) {
         conn.execute_batch(

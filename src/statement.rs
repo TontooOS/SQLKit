@@ -209,7 +209,7 @@ fn build_plan(
     filter: Option<&WhereClause>,
     bound: &[Value],
 ) -> Result<ScanPlan> {
-    let inner = conn.inner.borrow();
+    let inner = conn.read_inner();
     let table_key = table.to_ascii_lowercase();
     let tbl = inner.tables.get(&table_key).ok_or_else(|| SqlError::SqliteFailure {
         code: 1,
@@ -407,7 +407,7 @@ pub(crate) fn collect_rows(
         return Ok(rows);
     }
     let plan = build_plan(conn, table, requested, star, filter, bound)?;
-    let inner = conn.inner.borrow();
+    let inner = conn.read_inner();
     let tbl = inner.tables.get(&plan.table_key).ok_or_else(|| SqlError::SqliteFailure {
         code: 1,
         message: format!("no such table: {table}"),
@@ -519,7 +519,7 @@ fn select_width(conn: &Connection, stmt: &Stmt) -> Result<usize> {
     match stmt {
         Stmt::Select { star, items, table, joins, .. } => {
             if *star {
-                let inner = conn.inner.borrow();
+                let inner = conn.read_inner();
                 let mut width = 0usize;
                 let base = inner.tables.get(&table.to_ascii_lowercase()).ok_or_else(|| {
                     SqlError::SqliteFailure { code: 1, message: format!("no such table: {table}") }
@@ -739,7 +739,7 @@ fn eval_single_select_to_rows(
                     // positions, then project only the `OFFSET` / `LIMIT`
                     // window. Only filtered positions are buffered (existing
                     // guarantee); full rows are never cloned for sorting.
-                    let inner = conn.inner.borrow();
+                    let inner = conn.read_inner();
                     let tbl = inner.tables.get(&table.to_ascii_lowercase()).ok_or_else(|| {
                         SqlError::SqliteFailure { code: 1, message: format!("no such table: {table}") }
                     })?;
@@ -790,7 +790,7 @@ fn build_joined_rows(
     base: &str,
     joins: &[JoinClause],
 ) -> Result<JoinedTable> {
-    let inner = conn.inner.borrow();
+    let inner = conn.read_inner();
     let base_tbl = inner.tables.get(&base.to_ascii_lowercase()).ok_or_else(|| {
         SqlError::SqliteFailure { code: 1, message: format!("no such table: {base}") }
     })?;
@@ -1044,7 +1044,7 @@ fn project_rows(
         let shared: SharedColumns = if combined_cols.iter().any(|c| c.contains('.')) {
             Rc::new(combined_cols.to_vec())
         } else {
-            let inner = conn.inner.borrow();
+            let inner = conn.read_inner();
             let tbl = inner.tables.get(&base_table.to_ascii_lowercase()).ok_or_else(|| {
                 SqlError::SqliteFailure { code: 1, message: format!("no such table: {base_table}") }
             })?;
@@ -1526,7 +1526,7 @@ impl<'conn, F> MappedRows<'conn, F> {
     fn init_sorted(&mut self) -> Result<()> {
         self.ensure_plan()?;
         let (table_cols, positions, plan) = {
-            let inner = self.conn.inner.borrow();
+            let inner = self.conn.read_inner();
             // Clone the small plan for use after the borrow ends.
             let plan = self
                 .plan
@@ -1564,7 +1564,7 @@ impl<'conn, F> MappedRows<'conn, F> {
         };
         let mut positions = positions;
         {
-            let inner = self.conn.inner.borrow();
+            let inner = self.conn.read_inner();
             let tbl = inner.tables.get(&plan.table_key).ok_or_else(|| SqlError::SqliteFailure {
                 code: 1,
                 message: "no such table".to_string(),
@@ -1645,7 +1645,7 @@ impl<'conn, F> MappedRows<'conn, F> {
                 _ => return Err(SqlError::ExecuteReturnedResults),
             };
             let next_batch: Option<Vec<Vec<Value>>> = {
-                let inner = self.conn.inner.borrow();
+                let inner = self.conn.read_inner();
                 let base_tbl = inner.tables.get(&table.to_ascii_lowercase()).ok_or_else(|| {
                     SqlError::SqliteFailure { code: 1, message: format!("no such table: {table}") }
                 })?;
@@ -1838,7 +1838,7 @@ where
                 // the mapping closure runs, so the closure may still write
                 // through the connection.
                 {
-                    let inner = self.conn.inner.borrow();
+                    let inner = self.conn.read_inner();
                     let stale = match self.plan.as_ref() {
                         Some(plan) => match inner.tables.get(&plan.table_key) {
                             Some(tbl) => tbl.columns.len() != plan.ncols,

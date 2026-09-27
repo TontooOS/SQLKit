@@ -7,9 +7,9 @@ use crate::statement::Statement;
 use crate::transaction::Transaction;
 use crate::value::{FromValue, IntoParams, Value};
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Column schema stored per table.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -158,13 +158,13 @@ impl PkKey {
 /// Database connection. Mirrors the `rusqlite::Connection` subset used by
 /// CoreData: `open`, `execute`, `execute_batch`, `prepare`, `transaction`.
 pub struct Connection {
-    pub(crate) inner: RefCell<Inner>,
+    pub(crate) inner: RwLock<Inner>,
     /// Parsed-statement cache keyed by the exact SQL text. Parsing depends
     /// only on the SQL string, never on schema or data state, so entries
-    /// never go stale. Kept in its own `RefCell` (not inside `Inner`) so
+    /// never go stale. Kept in its own `Mutex` (not inside `Inner`) so
     /// `execute` can run directly from the cache borrow while `run_stmt`
     /// mutably borrows `inner`. Bounded by [`STMT_CACHE_CAP`].
-    stmt_cache: RefCell<HashMap<String, Stmt>>,
+    stmt_cache: Mutex<HashMap<String, Stmt>>,
 }
 
 /// Maximum statements held by [`Connection::stmt_cache`]. When the cache is
@@ -173,10 +173,34 @@ pub struct Connection {
 const STMT_CACHE_CAP: usize = 256;
 
 impl Connection {
+    /// Shared lock on the database state. Guards are never held across
+    /// user code (mapping closures, `ToSql`/`FromValue` impls) or across a
+    /// second lock, so callbacks may freely reenter the connection.
+    pub(crate) fn read_inner(&self) -> RwLockReadGuard<'_, Inner> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Exclusive lock on the database state. Same reentrancy rules as
+    /// [`Connection::read_inner`]: never held across user code.
+    pub(crate) fn write_inner(&self) -> RwLockWriteGuard<'_, Inner> {
+        self.inner.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Lock on the parsed-statement cache. Always taken before (never while
+    /// holding) the state lock, so the `cache -> inner` order is global and
+    /// cannot deadlock.
+    pub(crate) fn lock_cache(&self) -> MutexGuard<'_, HashMap<String, Stmt>> {
+        self.stmt_cache.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn lock_cache_mut(&self) -> MutexGuard<'_, HashMap<String, Stmt>> {
+        self.stmt_cache.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn fresh(path: Option<PathBuf>) -> Self {
         let loaded = path.is_none();
         Self {
-            inner: RefCell::new(Inner {
+                inner: RwLock::new(Inner {
                 path,
                 tables: HashMap::new(),
                 indexes: HashMap::new(),
@@ -195,7 +219,7 @@ impl Connection {
                 loaded,
                 dirty: false,
             }),
-            stmt_cache: RefCell::new(HashMap::new()),
+            stmt_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -216,13 +240,13 @@ impl Connection {
         if !pager::file_exists(&path) {
             let conn = Self::fresh(Some(path.clone()));
             pager::create_new(&path)?;
-            conn.inner.borrow_mut().file_kind = FileKind::Native;
+            conn.write_inner().file_kind = FileKind::Native;
             return Ok(conn);
         }
         // Header validation first: non-SQLite files stay `NotSqliteFile`.
         let file_kind = pager::peek_kind(&path)?;
         let conn = Self::fresh(Some(path));
-        conn.inner.borrow_mut().file_kind = file_kind;
+        conn.write_inner().file_kind = file_kind;
         Ok(conn)
     }
 
@@ -231,7 +255,7 @@ impl Connection {
     /// `prepare` or transaction pulls the data in. In-memory connections
     /// and already-loaded ones return immediately.
     pub(crate) fn ensure_loaded(&self) -> Result<()> {
-        if self.inner.borrow().loaded {
+        if self.read_inner().loaded {
             return Ok(());
         }
         self.load_from_disk()
@@ -256,7 +280,7 @@ impl Connection {
             return Ok(None);
         }
         let (loaded, kind, path) = {
-            let inner = self.inner.borrow();
+            let inner = self.read_inner();
             (inner.loaded, inner.file_kind, inner.path.clone())
         };
         if loaded {
@@ -280,9 +304,9 @@ impl Connection {
 
     fn load_from_disk(&self) -> Result<()> {
         let (file_kind, path) = {
-            let inner = self.inner.borrow();
+            let inner = self.read_inner();
             let Some(path) = inner.path.clone() else {
-                self.inner.borrow_mut().loaded = true;
+                self.write_inner().loaded = true;
                 return Ok(());
             };
             (inner.file_kind, path)
@@ -291,7 +315,7 @@ impl Connection {
             FileKind::Memory => {}
             FileKind::Snapshot => {
                 let tables = pager::load(&path)?;
-                let mut inner = self.inner.borrow_mut();
+                let mut inner = self.write_inner();
                 for (key, table) in tables {
                     let alias = crate::btree_write::rowid_alias_of(&table.columns);
                     let ids = crate::btree_write::synthesize_rowids(&table, alias);
@@ -307,7 +331,7 @@ impl Connection {
             }
             FileKind::Native => {
                 let detailed = crate::btree::load_foreign_detailed(&path)?;
-                let mut inner = self.inner.borrow_mut();
+                let mut inner = self.write_inner();
                 inner.persist = crate::btree_write::PersistState::fresh();
                 inner.persist.schema_cookie = detailed.schema_cookie.max(1);
                 inner.tables = detailed.tables;
@@ -346,7 +370,7 @@ impl Connection {
                 }
             }
         }
-        self.inner.borrow_mut().loaded = true;
+        self.write_inner().loaded = true;
         Ok(())
     }
 
@@ -361,16 +385,16 @@ impl Connection {
     /// always equals the last committed state. Snapshot files migrate to
     /// the native B-Tree layout through this same atomic rename.
     pub(crate) fn persist_if_needed(&self) -> Result<()> {
-        if self.inner.borrow().in_transaction {
+        if self.read_inner().in_transaction {
             return Ok(());
         }
         // Nothing changed (freshly opened or only read): skip the file
         // rewrite entirely. Set by `run_stmt` for every write statement.
-        if !self.inner.borrow().dirty {
+        if !self.read_inner().dirty {
             return Ok(());
         }
         let outcome = {
-            let inner = self.inner.borrow();
+            let inner = self.read_inner();
             let Some(path) = inner.path.clone() else {
                 return Ok(());
             };
@@ -399,7 +423,7 @@ impl Connection {
                 &inner.persist,
             )?
         };
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.write_inner();
         inner.persist.schema_cookie = outcome.schema_cookie;
         inner.persist.change_counter = outcome.change_counter;
         inner.persist.schema_dirty = false;
@@ -418,10 +442,10 @@ impl Connection {
         let bound = params.into_params()?;
         self.ensure_loaded()?;
         // Fast path: run directly from the cache borrow (no parse, no clone).
-        // `run_stmt` borrows `inner`, a different `RefCell`, so holding the
-        // cache borrow across the call is sound; `run_stmt` never touches the
+        // `run_stmt` locks `inner`, a different lock, so holding the
+        // cache guard across the call is sound; `run_stmt` never touches the
         // cache and never runs user code.
-        let cached = self.stmt_cache.borrow();
+        let cached = self.lock_cache();
         if let Some(stmt) = cached.get(sql) {
             let changes = self.run_stmt(stmt, &bound)?;
             let write = is_write(stmt);
@@ -446,7 +470,7 @@ impl Connection {
     /// first when it reached [`STMT_CACHE_CAP`]. Callers must have parsed the
     /// statement from `sql`, so the key always matches the value.
     fn insert_cached(&self, sql: &str, stmt: Stmt) {
-        let mut cache = self.stmt_cache.borrow_mut();
+        let mut cache = self.lock_cache_mut();
         if cache.len() >= STMT_CACHE_CAP {
             cache.clear();
         }
@@ -456,7 +480,7 @@ impl Connection {
     /// Parse one statement through the cache, returning an owned copy for
     /// `prepare` / `query_row`. Cache misses parse and populate the cache.
     fn parse_cached(&self, sql: &str) -> Result<Stmt> {
-        if let Some(stmt) = self.stmt_cache.borrow().get(sql) {
+        if let Some(stmt) = self.lock_cache().get(sql) {
             return Ok(stmt.clone());
         }
         let stmt = parser::parse_one(sql)?;
@@ -502,12 +526,12 @@ impl Connection {
 
     /// Number of rows changed by the last write.
     pub fn changes(&self) -> usize {
-        self.inner.borrow().changes
+        self.read_inner().changes
     }
 
     /// Checkpoint the WAL (basis: validates the pragma, no-op otherwise).
     pub fn checkpoint(&self) -> Result<()> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.write_inner();
         inner.pragmas.insert("wal_checkpoint".into(), "TRUNCATE".into());
         inner.dirty = true;
         drop(inner);
@@ -523,11 +547,11 @@ impl Connection {
 
     pub(crate) fn run_stmt(&self, stmt: &Stmt, bound: &[Value]) -> Result<usize> {
         if is_write(stmt) {
-            self.inner.borrow_mut().dirty = true;
+            self.write_inner().dirty = true;
         }
         match stmt {
             Stmt::Pragma { name, value } => {
-                let mut inner = self.inner.borrow_mut();
+                let mut inner = self.write_inner();
                 let key = name.to_ascii_lowercase();
                 if key == "wal_checkpoint" {
                     inner.pragmas.insert(key, value.clone().unwrap_or_default());
@@ -543,7 +567,7 @@ impl Connection {
                 columns,
                 if_not_exists,
             } => {
-                let mut inner = self.inner.borrow_mut();
+                let mut inner = self.write_inner();
                 if inner.tables.contains_key(&name.to_ascii_lowercase()) {
                     if *if_not_exists {
                         inner.changes = 0;
@@ -576,7 +600,7 @@ impl Connection {
                 columns,
                 if_not_exists,
             } => {
-                let mut inner = self.inner.borrow_mut();
+                let mut inner = self.write_inner();
                 if !inner.tables.contains_key(&table.to_ascii_lowercase()) {
                     return Err(SqlError::SqliteFailure {
                         code: 1,
@@ -608,7 +632,7 @@ impl Connection {
                 columns,
                 rows,
             } => {
-                let mut inner = self.inner.borrow_mut();
+                let mut inner = self.write_inner();
                 let key = table.to_ascii_lowercase();
                 // Resolve target slots and the primary-key position with a
                 // short shared borrow; the mutation below re-borrows.
@@ -836,7 +860,7 @@ impl Connection {
             }
             Stmt::Select { .. } | Stmt::Union { .. } => Err(SqlError::ExecuteReturnedResults),
             Stmt::AlterTable { table, column } => {
-                let mut inner = self.inner.borrow_mut();
+                let mut inner = self.write_inner();
                 let key = table.to_ascii_lowercase();
                 let (name, columns) = {
                     let tbl = inner.tables.get_mut(&key).ok_or_else(|| SqlError::SqliteFailure {
@@ -873,7 +897,7 @@ impl Connection {
                 assignments,
                 filter,
             } => {
-                let mut inner = self.inner.borrow_mut();
+                let mut inner = self.write_inner();
                 let key = table.to_ascii_lowercase();
                 // Compile assignments and the filter once; per-row work is
                 // then pure indexing with no string comparisons.
@@ -981,7 +1005,7 @@ impl Connection {
                 Ok(changed)
             }
             Stmt::Delete { table, filter } => {
-                let mut inner = self.inner.borrow_mut();
+                let mut inner = self.write_inner();
                 let key = table.to_ascii_lowercase();
                 let compiled: Option<CompiledWhere> = {
                     let tbl = inner.tables.get(&key).ok_or_else(|| SqlError::SqliteFailure {
@@ -1034,7 +1058,7 @@ impl Connection {
     }
 
     pub(crate) fn begin_inner(&self) -> Result<()> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.write_inner();
         if inner.in_transaction {
             return Err(SqlError::Transaction("already in a transaction".into()));
         }
@@ -1051,7 +1075,7 @@ impl Connection {
     }
 
     pub(crate) fn commit_inner(&self) -> Result<()> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.write_inner();
         if !inner.in_transaction {
             return Err(SqlError::Transaction("no transaction to commit".into()));
         }
@@ -1061,7 +1085,7 @@ impl Connection {
     }
 
     pub(crate) fn rollback_inner(&self) -> Result<()> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.write_inner();
         if !inner.in_transaction {
             return Err(SqlError::Transaction("no transaction to roll back".into()));
         }
