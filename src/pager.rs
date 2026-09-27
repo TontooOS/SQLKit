@@ -64,6 +64,33 @@ pub fn validate(path: &Path) -> Result<u32> {
     parse_header(&header)
 }
 
+/// Cheap backing-layout probe for lazy open: validates the magic and peeks
+/// at the snapshot marker (110 bytes, no full read). Snapshot files load
+/// through the legacy path; everything else with SQLite magic goes through
+/// the B-Tree reader (native and foreign alike).
+pub(crate) fn peek_kind(path: &Path) -> Result<crate::connection::FileKind> {
+    use std::io::Read;
+    let mut file = File::open(path)?;
+    let mut head = [0u8; 110];
+    let mut filled = 0usize;
+    while filled < head.len() {
+        match file.read(&mut head[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) => return Err(SqlError::Io(e)),
+        }
+    }
+    if filled < HEADER_LEN {
+        return Err(SqlError::NotSqliteFile("file smaller than SQLite header".into()));
+    }
+    parse_header(&head[..HEADER_LEN])?;
+    if filled >= 106 && head[100..106] == *SQLKIT_MARKER {
+        Ok(crate::connection::FileKind::Snapshot)
+    } else {
+        Ok(crate::connection::FileKind::Native)
+    }
+}
+
 /// Load tables from a snapshot file. Files without the SQLKit marker are
 /// read as foreign SQLite B-Tree files via [`crate::btree`]; files larger
 /// than 256 MiB are refused with `Unsupported`.

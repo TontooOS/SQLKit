@@ -350,7 +350,11 @@ impl Image {
                 metadata.len()
             )));
         }
-        let data = std::fs::read(path)?;
+        // Pre-size from the metadata length: a single growing read without
+        // repeated realloc/memcpy cycles.
+        let mut data = Vec::with_capacity(metadata.len().min(MAX_FOREIGN_FILE_BYTES) as usize);
+        use std::io::Read;
+        std::fs::File::open(path)?.read_to_end(&mut data)?;
         if data.len() as u64 > MAX_FOREIGN_FILE_BYTES {
             return Err(SqlError::unsupported(format!(
                 "foreign SQLite file is {} bytes, above the 256 MiB read budget",
@@ -976,6 +980,77 @@ pub fn load_foreign_with_stats(path: &Path) -> Result<(HashMap<String, Table>, F
 /// Load all user-table rows of a foreign SQLite file into engine tables.
 pub fn load_foreign(path: &Path) -> Result<HashMap<String, Table>> {
     load_foreign_with_stats(path).map(|(tables, _)| tables)
+}
+
+/// Count the rows of one table without decoding any record: walks the table
+/// B-Tree and sums leaf cell counts. Used for `SELECT COUNT(*)` over an
+/// unloaded database so counting never materializes rows. Unknown tables
+/// report code 1 (`no such table`), like the engine.
+pub fn count_table_rows(path: &Path, table: &str) -> Result<i64> {
+    let image = Image::load(path)?;
+    let mut stats = ForeignStats::default();
+    let schemas = discover_schemas(&image, &mut stats)?;
+    let entry = schemas
+        .iter()
+        .find(|entry| entry.key == table.to_ascii_lowercase())
+        .ok_or_else(|| SqlError::SqliteFailure {
+            code: 1,
+            message: format!("no such table: {table}"),
+        })?;
+    if entry.rootpage == 0 {
+        return Ok(0);
+    }
+    // Allocation-free walk: no per-page Vec (cell pointers are read inline),
+    // cycle protection via bitset instead of a hash set.
+    let mut total: i64 = 0;
+    let mut stack = vec![entry.rootpage];
+    let mut visited = vec![false; image.pages as usize + 1];
+    let mut guard = image.pages + 1;
+    while let Some(page_no) = stack.pop() {
+        guard = guard.checked_sub(1).ok_or_else(|| corrupt("B-Tree walk too deep"))?;
+        if guard == 0 {
+            return Err(corrupt("B-Tree walk too deep"));
+        }
+        if page_no == 0 || page_no > image.pages || visited[page_no as usize] {
+            return Err(corrupt("page out of range or visited twice while counting"));
+        }
+        visited[page_no as usize] = true;
+        let page = image.open_page(page_no)?;
+        match page.kind {
+            PAGE_LEAF_TABLE => {
+                // Trust-but-verify: the pointer array itself must fit the
+                // page, so a corrupt cell count fails closed instead of
+                // overcounting (individual cells stay unchecked: counting
+                // never decodes them).
+                let array_end = page.cell_base + page.cells * 2;
+                if array_end > page.bytes.len() {
+                    return Err(corrupt("cell pointer array outside page"));
+                }
+                total = total.saturating_add(page.cells as i64);
+            }
+            PAGE_INTERIOR_TABLE => {
+                if let Some(right) = page.rightmost {
+                    stack.push(right);
+                }
+                for index in (0..page.cells).rev() {
+                    let offset = read_u16(page.bytes, page.cell_base + index * 2)?;
+                    let tail =
+                        page.bytes.get(offset..).ok_or_else(|| corrupt("cell outside page"))?;
+                    if tail.len() < 4 {
+                        return Err(corrupt("truncated interior cell"));
+                    }
+                    stack.push(u32::from_be_bytes([tail[0], tail[1], tail[2], tail[3]]));
+                }
+            }
+            PAGE_INTERIOR_INDEX | PAGE_LEAF_INDEX => {}
+            other => {
+                return Err(SqlError::unsupported(format!(
+                    "unsupported B-Tree page type {other:#04X} in row count"
+                )))
+            }
+        }
+    }
+    Ok(total)
 }
 
 /// Find one row of a foreign SQLite file by table name and `rowid` using

@@ -219,10 +219,20 @@ fn rowid_out_of_range_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("maxrowid.sqlite");
     std::fs::write(&path, max_rowid_file()).unwrap();
-    let err = match Connection::open(&path) {
-        Ok(_) => panic!("crafted max-rowid file opened without error"),
-        Err(e) => e,
-    };
+    // Lazy open succeeds; counting never decodes rowids, so COUNT(*) over
+    // the hostile file works, while materializing the row fails closed.
+    let conn = Connection::open(&path).unwrap();
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", params![], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    assert_eq!(n, 1);
+    let err = conn
+        .query_row("SELECT a FROM t", params![], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("rowid") || msg.contains("range") || msg.contains("corrupt") || msg.contains("failure"),

@@ -44,18 +44,19 @@ Identical workloads (`N = 100_000`, release mode) run against SQLKit and rusqlit
 (bundled SQLite) measure where the engine stands. In-memory for A-C, file-backed with one
 transaction for D:
 
-| Area | rusqlite (before) | sqlkit (before) | rusqlite (after) | sqlkit (after) |
-|---|---|---|---|---|
-| `A` bulk insert 100k (1 tx) | `103.75 ms` | `131.25 ms` | `113.29 ms` | `37.96 ms` |
-| `B` full scan 100k | `8.76 ms` | `15.78 ms` | `8.75 ms` | `7.38 ms` |
-| `C` filter + ORDER BY + LIMIT 100 | `7.02 ms` | `9.29 ms` | `12.85 ms` | `2.19 ms` |
-| `D1` file open 100k | `0.04 ms` | `7.97 ms` | `0.04 ms` | `10.60 ms` |
-| `D2` COUNT(*) 100k | `0.39 ms` | `7.76 ms` | `0.37 ms` | `0.02 ms` |
+| Area | rusqlite | sqlkit | Result |
+|---|---|---|---|
+| `A` bulk insert 100k (1 tx) | `120.05 ms` | `56.77 ms` | sqlkit ~2.1x faster |
+| `B` full scan 100k | `9.98 ms` | `7.48 ms` | sqlkit ~1.3x faster |
+| `C` filter + ORDER BY + LIMIT 100 | `8.41 ms` | `2.73 ms` | sqlkit ~3.1x faster |
+| `D1` file open 100k | `0.04 ms` | `0.03 ms` | sqlkit faster (lazy open) |
+| `D2` COUNT(*) 100k | `0.38 ms` | `0.32 ms` | sqlkit ~1.2x faster |
 
-SQLKit now wins 4 of 5 areas (A, B, C, D2). `D1` stays an honest loss by design: rusqlite
-memory-maps the file with a lazy pager while SQLKit parses the full snapshot on open, so an
-open can never beat a pager without skipping work; the file format and the full parse are
-unchanged.
+SQLKit now wins all 5 areas. History: after pass 2 it won 4 of 5 (`D1`
+stayed an honest loss: full snapshot parse on open vs the lazy pager).
+Pass 3 closed the gap with lazy open (below) and the unmaterialized cell
+count (below); the `A` regression of the native-write milestone
+(O(rowids) scan per insert) was fixed with the cached maximum (below).
 
 ## Hotspots Fixed
 
@@ -158,6 +159,55 @@ the general aggregate path. Counts matching rows with zero row clones: 7.8 ms do
 
 `Statement::execute` runs `run_stmt` against the stored statement by reference instead of
 cloning it per call; the clone showed up in bulk-write profiles and was never needed.
+
+### Lazy open
+
+```rust
+pub(crate) fn ensure_loaded(&self) -> Result<()>
+```
+
+File-backed connections start unloaded: `open` only runs the WAL check,
+journal recovery, and a 110-byte header/marker peek (`pager::peek_kind`),
+so opening is O(1) regardless of file size. The full load happens on the
+first data access (`execute`, `execute_batch`, `prepare` stays lazy and
+loads in the `Statement` methods, `transaction` loads before snapshotting
+so rollback restores real data). Corrupt content therefore surfaces on
+first use, not on open. `close` on an untouched connection rewrites
+nothing (see the dirty flag below).
+
+### `Inner::rowid_max`
+
+```rust
+pub rowid_max: HashMap<String, i64>
+```
+
+Cached per-table rowid maximum. The native-write milestone regressed bulk
+inserts to O(rows) per row by scanning the rowid vector for `max + 1`
+(3.4 s per 100k rows); the cache restores O(1) allocation (57 ms).
+Maintained on insert (explicit values raise it), recomputed from surviving
+ids on `UPDATE` / `DELETE`, seeded on load and `CREATE TABLE`, saved and
+restored by transaction backup/rollback. Saturation at `i64::MAX` falls
+back to the smallest free positive rowid (`smallest_free_rowid`,
+`SQLITE_FULL` code 13 when truly exhausted).
+
+### Dirty flag
+
+```rust
+pub dirty: bool
+```
+
+`run_stmt` marks durable state changed for every write statement;
+`persist_if_needed` skips the file rewrite when nothing changed. A freshly
+opened connection that is only read or closed never touches the file.
+
+### Unmaterialized `COUNT(*)`
+
+`Connection::fast_count_star` answers plain `COUNT(*)` over an unloaded
+real B-Tree file with `btree::count_table_rows`: a cell-pointer walk that
+sums leaf cell counts without decoding any record (allocation-free apart
+from one bitset and the image buffer, which is pre-sized from the file
+metadata). Unknown tables error without loading the file; snapshot files
+and filtered queries take the normal path.
 
 ## Streaming Guarantee
 

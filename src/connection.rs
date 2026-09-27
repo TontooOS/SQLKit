@@ -82,11 +82,25 @@ pub(crate) struct Inner {
     /// Assigned as `max + 1` per table; `INTEGER PRIMARY KEY` values double
     /// as rowids, exactly like SQLite.
     pub rowids: HashMap<String, Vec<i64>>,
+    /// Cached per-table rowid maximum (`max + 1` is the next free rowid).
+    /// Maintained on every write path so bulk inserts never rescan the
+    /// rowid vector (which would be O(rows) per row). Never serialized;
+    /// rebuilt from `rowids` on load and restored from `backup` on rollback.
+    pub rowid_max: HashMap<String, i64>,
     /// Native persist state: schema cookie, dirty flag, change counter.
     pub persist: crate::btree_write::PersistState,
     /// Backing file layout: transient memory, legacy snapshot (migrated on
     /// the first write), or native B-Tree.
     pub file_kind: FileKind,
+    /// Whether table data is loaded. File-backed connections open lazily:
+    /// `open` only validates the header and journals, the full load happens
+    /// on the first data access (`ensure_loaded`). In-memory connections
+    /// start loaded.
+    pub loaded: bool,
+    /// True once an unpersisted write changed durable state. Lets
+    /// `persist_if_needed` skip file rewrites when nothing changed (for
+    /// example a freshly opened connection that is only read or closed).
+    pub dirty: bool,
 }
 
 /// One in-memory index definition.
@@ -106,6 +120,7 @@ pub(crate) struct Backup {
     pub schemas: HashMap<String, String>,
     pub display_names: HashMap<String, String>,
     pub rowids: HashMap<String, Vec<i64>>,
+    pub rowid_max: HashMap<String, i64>,
     pub indexes: HashMap<String, IndexEntry>,
 }
 
@@ -159,6 +174,7 @@ const STMT_CACHE_CAP: usize = 256;
 
 impl Connection {
     fn fresh(path: Option<PathBuf>) -> Self {
+        let loaded = path.is_none();
         Self {
             inner: RefCell::new(Inner {
                 path,
@@ -173,8 +189,11 @@ impl Connection {
                 schemas: HashMap::new(),
                 display_names: HashMap::new(),
                 rowids: HashMap::new(),
+                rowid_max: HashMap::new(),
                 persist: crate::btree_write::PersistState::fresh(),
                 file_kind: FileKind::Memory,
+                loaded,
+                dirty: false,
             }),
             stmt_cache: RefCell::new(HashMap::new()),
         }
@@ -185,8 +204,11 @@ impl Connection {
     /// The open refuses files with uncheckpointed `-wal` content
     /// (`Unsupported`, never a silent stale read) and rolls back a leftover
     /// SQLKit `-journal` before reading. New files are created as real
-    /// minimal native SQLite databases. Legacy snapshot files load as before
-    /// and migrate to the native layout on the first write.
+    /// minimal native SQLite databases. The open itself is LAZY: it only
+    /// validates the header and journals, so opening is O(1) regardless of
+    /// file size; table data loads on the first data access (see
+    /// `ensure_loaded`). Legacy snapshot files load as before and migrate
+    /// to the native layout on the first write.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         crate::btree_write::check_wal(&path)?;
@@ -198,17 +220,82 @@ impl Connection {
             return Ok(conn);
         }
         // Header validation first: non-SQLite files stay `NotSqliteFile`.
-        pager::validate(&path)?;
-        if pager::is_snapshot_file(&path) {
-            let tables = pager::load(&path)?;
-            let conn = Self::fresh(Some(path));
+        let file_kind = pager::peek_kind(&path)?;
+        let conn = Self::fresh(Some(path));
+        conn.inner.borrow_mut().file_kind = file_kind;
+        Ok(conn)
+    }
+
+    /// Load table data from disk when it is first needed. File-backed
+    /// connections start unloaded so `open` stays O(1); the first `execute`,
+    /// `prepare` or transaction pulls the data in. In-memory connections
+    /// and already-loaded ones return immediately.
+    pub(crate) fn ensure_loaded(&self) -> Result<()> {
+        if self.inner.borrow().loaded {
+            return Ok(());
+        }
+        self.load_from_disk()
+    }
+
+    /// Try `SELECT COUNT(*)` without materializing the tables. Returns
+    /// `Ok(Some(n))` only for the unloaded file-backed case with a plain
+    /// `COUNT(*)` over one real B-Tree table (cell walk, no record decode);
+    /// `Ok(None)` means "use the normal path" (already loaded, snapshot
+    /// file, filtered or complex query). Unknown tables error here so the
+    /// caller never loads a whole file just to report "no such table".
+    pub(crate) fn fast_count_star(&self, stmt: &Stmt, bound: &[Value]) -> Result<Option<i64>> {
+        let (table, filter) = match stmt {
+            Stmt::Select { table, filter, count_star: true, joins, group_by, having, distinct, .. }
+                if joins.is_empty() && group_by.is_empty() && having.is_none() && !distinct =>
             {
-                let mut inner = conn.inner.borrow_mut();
-                inner.file_kind = FileKind::Snapshot;
-                inner.persist = crate::btree_write::PersistState::fresh();
+                (table.clone(), filter.clone())
+            }
+            _ => return Ok(None),
+        };
+        if filter.is_some() || !bound.is_empty() {
+            return Ok(None);
+        }
+        let (loaded, kind, path) = {
+            let inner = self.inner.borrow();
+            (inner.loaded, inner.file_kind, inner.path.clone())
+        };
+        if loaded {
+            return Ok(None);
+        }
+        let Some(path) = path else {
+            return Ok(None);
+        };
+        if kind != FileKind::Native {
+            return Ok(None);
+        }
+        match crate::btree::count_table_rows(&path, &table) {
+            Ok(n) => Ok(Some(n)),
+            Err(SqlError::SqliteFailure { code: 1, .. }) => Err(SqlError::SqliteFailure {
+                code: 1,
+                message: format!("no such table: {table}"),
+            }),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn load_from_disk(&self) -> Result<()> {
+        let (file_kind, path) = {
+            let inner = self.inner.borrow();
+            let Some(path) = inner.path.clone() else {
+                self.inner.borrow_mut().loaded = true;
+                return Ok(());
+            };
+            (inner.file_kind, path)
+        };
+        match file_kind {
+            FileKind::Memory => {}
+            FileKind::Snapshot => {
+                let tables = pager::load(&path)?;
+                let mut inner = self.inner.borrow_mut();
                 for (key, table) in tables {
                     let alias = crate::btree_write::rowid_alias_of(&table.columns);
                     let ids = crate::btree_write::synthesize_rowids(&table, alias);
+                    inner.rowid_max.insert(key.clone(), ids.iter().copied().max().unwrap_or(0));
                     inner.schemas.insert(
                         key.clone(),
                         crate::btree_write::create_table_sql(&table.name, &table.columns),
@@ -218,43 +305,49 @@ impl Connection {
                     inner.tables.insert(key, table);
                 }
             }
-            return Ok(conn);
-        }
-        let detailed = crate::btree::load_foreign_detailed(&path)?;
-        let conn = Self::fresh(Some(path));
-        {
-            let mut inner = conn.inner.borrow_mut();
-            inner.file_kind = FileKind::Native;
-            inner.persist = crate::btree_write::PersistState::fresh();
-            inner.persist.schema_cookie = detailed.schema_cookie.max(1);
-            inner.tables = detailed.tables;
-            inner.rowids = detailed.rowids;
-            inner.schemas = detailed.schemas;
-            inner.display_names = detailed.display_names;
-            for index in detailed.indexes {
-                inner.indexes.insert(
-                    index.name.to_ascii_lowercase(),
-                    IndexEntry {
-                        name: index.name.clone(),
-                        table: index.table.clone(),
-                        columns: index.columns.clone(),
-                        sql: index.sql.clone(),
-                    },
-                );
-            }
-            // Defensive repair: rowid vectors always parallel the rows.
-            let keys: Vec<String> = inner.tables.keys().cloned().collect();
-            for key in keys {
-                let table = inner.tables.get(&key).ok_or_else(|| missing_table(&key))?;
-                let ok = inner.rowids.get(&key).map(|ids| ids.len() == table.rows.len()).unwrap_or(false);
-                if !ok {
-                    let alias = crate::btree_write::rowid_alias_of(&table.columns);
-                    let ids = crate::btree_write::synthesize_rowids(table, alias);
-                    inner.rowids.insert(key, ids);
+            FileKind::Native => {
+                let detailed = crate::btree::load_foreign_detailed(&path)?;
+                let mut inner = self.inner.borrow_mut();
+                inner.persist = crate::btree_write::PersistState::fresh();
+                inner.persist.schema_cookie = detailed.schema_cookie.max(1);
+                inner.tables = detailed.tables;
+                inner.rowids = detailed.rowids;
+                inner.schemas = detailed.schemas;
+                inner.display_names = detailed.display_names;
+                for index in detailed.indexes {
+                    inner.indexes.insert(
+                        index.name.to_ascii_lowercase(),
+                        IndexEntry {
+                            name: index.name.clone(),
+                            table: index.table.clone(),
+                            columns: index.columns.clone(),
+                            sql: index.sql.clone(),
+                        },
+                    );
+                }
+                // Defensive repair: rowid vectors always parallel the rows.
+                let keys: Vec<String> = inner.tables.keys().cloned().collect();
+                for key in keys {
+                    let table = inner.tables.get(&key).ok_or_else(|| missing_table(&key))?;
+                    let ok = inner.rowids.get(&key).map(|ids| ids.len() == table.rows.len()).unwrap_or(false);
+                    if !ok {
+                        let alias = crate::btree_write::rowid_alias_of(&table.columns);
+                        let ids = crate::btree_write::synthesize_rowids(table, alias);
+                        inner.rowids.insert(key, ids);
+                    }
+                }
+                let maxima: Vec<(String, i64)> = inner
+                    .rowids
+                    .iter()
+                    .map(|(key, ids)| (key.clone(), ids.iter().copied().max().unwrap_or(0)))
+                    .collect();
+                for (key, max) in maxima {
+                    inner.rowid_max.insert(key, max);
                 }
             }
         }
-        Ok(conn)
+        self.inner.borrow_mut().loaded = true;
+        Ok(())
     }
 
     /// Open a transient in-memory database.
@@ -269,6 +362,11 @@ impl Connection {
     /// the native B-Tree layout through this same atomic rename.
     pub(crate) fn persist_if_needed(&self) -> Result<()> {
         if self.inner.borrow().in_transaction {
+            return Ok(());
+        }
+        // Nothing changed (freshly opened or only read): skip the file
+        // rewrite entirely. Set by `run_stmt` for every write statement.
+        if !self.inner.borrow().dirty {
             return Ok(());
         }
         let outcome = {
@@ -306,6 +404,7 @@ impl Connection {
         inner.persist.change_counter = outcome.change_counter;
         inner.persist.schema_dirty = false;
         inner.file_kind = FileKind::Native;
+        inner.dirty = false;
         Ok(())
     }
 
@@ -317,6 +416,7 @@ impl Connection {
     /// entirely and run straight from the cached statement.
     pub fn execute(&self, sql: &str, params: impl IntoParams) -> Result<usize> {
         let bound = params.into_params()?;
+        self.ensure_loaded()?;
         // Fast path: run directly from the cache borrow (no parse, no clone).
         // `run_stmt` borrows `inner`, a different `RefCell`, so holding the
         // cache borrow across the call is sound; `run_stmt` never touches the
@@ -367,6 +467,7 @@ impl Connection {
     /// Run several statements without parameters (also accepts PRAGMA /
     /// SELECT that return rows, like ruslite).
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
+        self.ensure_loaded()?;
         let stmts = parser::parse_batch(sql)?;
         for stmt in &stmts {
             let _ = self.run_stmt(stmt, &[])?;
@@ -393,6 +494,8 @@ impl Connection {
 
     /// Begin a transaction; rolls back on drop unless committed.
     pub fn transaction(&self) -> Result<Transaction<'_>> {
+        // Load before snapshotting so rollback restores real data.
+        self.ensure_loaded()?;
         self.begin_inner()?;
         Ok(Transaction::new(self))
     }
@@ -404,10 +507,10 @@ impl Connection {
 
     /// Checkpoint the WAL (basis: validates the pragma, no-op otherwise).
     pub fn checkpoint(&self) -> Result<()> {
-        self.inner
-            .borrow_mut()
-            .pragmas
-            .insert("wal_checkpoint".into(), "TRUNCATE".into());
+        let mut inner = self.inner.borrow_mut();
+        inner.pragmas.insert("wal_checkpoint".into(), "TRUNCATE".into());
+        inner.dirty = true;
+        drop(inner);
         self.persist_if_needed()?;
         Ok(())
     }
@@ -419,6 +522,9 @@ impl Connection {
     }
 
     pub(crate) fn run_stmt(&self, stmt: &Stmt, bound: &[Value]) -> Result<usize> {
+        if is_write(stmt) {
+            self.inner.borrow_mut().dirty = true;
+        }
         match stmt {
             Stmt::Pragma { name, value } => {
                 let mut inner = self.inner.borrow_mut();
@@ -458,6 +564,7 @@ impl Connection {
                 inner.display_names.insert(key.clone(), name.clone());
                 inner.schemas.insert(key.clone(), sql);
                 inner.rowids.insert(key.clone(), Vec::new());
+                inner.rowid_max.insert(key.clone(), 0);
                 inner.tables.insert(key, table);
                 inner.persist.schema_dirty = true;
                 inner.changes = 0;
@@ -548,16 +655,41 @@ impl Connection {
                 // Rowid allocation (`max + 1` per table): explicit `INTEGER
                 // PRIMARY KEY` values double as rowids, `NULL` aliases are
                 // auto-assigned (and filled into the row, SQLite style),
-                // every other row takes the next free rowid.
+                // every other row takes the next free rowid. The per-table
+                // maximum is cached (`rowid_max`) so bulk inserts never
+                // rescan the rowid vector (O(rows) per row); it is
+                // maintained on every write path and restored on rollback.
                 let alias = {
                     let tbl = inner.tables.get(&key).ok_or_else(|| missing_table(&key))?;
                     crate::btree_write::rowid_alias_of(&tbl.columns)
                 };
-                let mut next = inner
-                    .rowids
-                    .get(&key)
-                    .map(|ids| crate::btree_write::next_rowid(ids))
-                    .unwrap_or(1);
+                let base = inner.rowid_max.get(&key).copied().unwrap_or(0);
+                let mut next = base.saturating_add(1).max(1);
+                // Running maximum over old and staged ids. Derived from the
+                // assigned ids (not from `next`, which saturates at
+                // i64::MAX) so an explicitly inserted i64::MAX stays cached.
+                let mut top = base;
+                // Saturation fallback: when every rowid up to i64::MAX is
+                // taken (only reachable with explicitly inserted huge ids),
+                // reuse the smallest free positive rowid like SQLite does
+                // instead of colliding. O(n) once per statement, only in
+                // this pathological corner.
+                let mut gaps: Option<std::collections::HashSet<i64>> = None;
+                if base == i64::MAX {
+                    let mut set: std::collections::HashSet<i64> = inner
+                        .rowids
+                        .get(&key)
+                        .map(|ids| ids.iter().copied().collect())
+                        .unwrap_or_default();
+                    if let Some(pos) = alias {
+                        for row in staged.iter() {
+                            if let Value::Integer(v) = row[pos] {
+                                set.insert(v);
+                            }
+                        }
+                    }
+                    gaps = Some(set);
+                }
                 let mut new_ids = Vec::with_capacity(staged.len());
                 for row in staged.iter_mut() {
                     let id = match alias {
@@ -566,20 +698,51 @@ impl Connection {
                                 if v >= next {
                                     next = v.saturating_add(1);
                                 }
+                                top = top.max(v);
                                 v
                             }
                             _ => {
-                                let id = next;
-                                next = next.saturating_add(1).max(1);
+                                let id = match gaps.as_mut() {
+                                    Some(used) => {
+                                        let free = smallest_free_rowid(used).ok_or_else(|| {
+                                            SqlError::SqliteFailure {
+                                                code: 13,
+                                                message: "database or disk is full".into(),
+                                            }
+                                        })?;
+                                        used.insert(free);
+                                        free
+                                    }
+                                    None => {
+                                        let id = next;
+                                        next = next.saturating_add(1).max(1);
+                                        id
+                                    }
+                                };
+                                top = top.max(id);
                                 row[pos] = Value::Integer(id);
                                 id
                             }
                         },
-                        None => {
-                            let id = next;
-                            next = next.saturating_add(1).max(1);
-                            id
-                        }
+                        None => match gaps.as_mut() {
+                            Some(used) => {
+                                let free = smallest_free_rowid(used).ok_or_else(|| {
+                                    SqlError::SqliteFailure {
+                                        code: 13,
+                                        message: "database or disk is full".into(),
+                                    }
+                                })?;
+                                used.insert(free);
+                                top = top.max(free);
+                                free
+                            }
+                            None => {
+                                let id = next;
+                                next = next.saturating_add(1).max(1);
+                                top = top.max(id);
+                                id
+                            }
+                        },
                     };
                     new_ids.push(id);
                 }
@@ -665,6 +828,8 @@ impl Connection {
                     inner.rowids.entry(key.clone()).or_default().extend(new_ids);
                     changed = count;
                 }
+                let top = next.saturating_sub(1).max(base).max(top);
+                inner.rowid_max.insert(key.clone(), top);
                 inner.last_rowid += changed as i64;
                 inner.changes = changed;
                 Ok(changed)
@@ -805,7 +970,12 @@ impl Connection {
                     inner.rowids.insert(key.clone(), new_ids);
                 }
                 // Row positions may have shifted values; drop the PK cache so
-                // the next insert rebuilds it from current rows.
+                // the next insert rebuilds it from current rows. Refresh the
+                // cached rowid maximum from the surviving ids.
+                if let Some(ids) = inner.rowids.get(&key) {
+                    let max = ids.iter().copied().max().unwrap_or(0);
+                    inner.rowid_max.insert(key.clone(), max);
+                }
                 inner.pk_cache.remove(&key);
                 inner.changes = changed;
                 Ok(changed)
@@ -848,6 +1018,10 @@ impl Connection {
                 // (the rebuilt image preserves the file size); rowids of the
                 // surviving rows travel with them.
                 inner.rowids.insert(key.clone(), kept_ids);
+                if let Some(ids) = inner.rowids.get(&key) {
+                    let max = ids.iter().copied().max().unwrap_or(0);
+                    inner.rowid_max.insert(key.clone(), max);
+                }
                 inner.pk_cache.remove(&key);
                 let changed = before - inner.tables.get(&key).ok_or_else(|| missing_table(&key))?.rows.len();
                 inner.changes = changed;
@@ -869,6 +1043,7 @@ impl Connection {
             schemas: inner.schemas.clone(),
             display_names: inner.display_names.clone(),
             rowids: inner.rowids.clone(),
+            rowid_max: inner.rowid_max.clone(),
             indexes: inner.indexes.clone(),
         });
         inner.in_transaction = true;
@@ -895,6 +1070,7 @@ impl Connection {
             inner.schemas = backup.schemas;
             inner.display_names = backup.display_names;
             inner.rowids = backup.rowids;
+            inner.rowid_max = backup.rowid_max;
             inner.indexes = backup.indexes;
         }
         // Restored rows invalidate cached PK positions.
@@ -911,6 +1087,19 @@ impl Connection {
 /// (never a panic) so crafted input can never crash the process.
 fn missing_table(key: &str) -> SqlError {
     SqlError::SqliteFailure { code: 1, message: format!("no such table: {key}") }
+}
+
+/// Smallest positive rowid not in `used`; `None` when the whole range is
+/// exhausted (practically unreachable, only via explicit `i64::MAX`
+/// inserts filling the space).
+fn smallest_free_rowid(used: &std::collections::HashSet<i64>) -> Option<i64> {
+    let mut candidate = 1i64;
+    loop {
+        if !used.contains(&candidate) {
+            return Some(candidate);
+        }
+        candidate = candidate.checked_add(1)?;
+    }
 }
 
 pub(crate) fn resolve_expr(expr: &Expr, bound: &[Value]) -> Result<Value> {

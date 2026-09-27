@@ -81,6 +81,9 @@ impl<'conn> Statement<'conn> {
     /// Execute a write statement; errors with `ExecuteReturnedResults` on SELECT.
     pub fn execute(&mut self, params: impl IntoParams) -> Result<usize> {
         let bound = params.into_params()?;
+        // `prepare` stays lazy (see `Connection::open`); the first data
+        // access pulls file-backed tables in.
+        self.conn.ensure_loaded()?;
         match &self.stmt {
             Stmt::Select { .. } | Stmt::Union { .. } => Err(SqlError::ExecuteReturnedResults),
             other => {
@@ -128,6 +131,12 @@ impl<'conn> Statement<'conn> {
             Stmt::Select { .. } | Stmt::Union { .. } => self.stmt.clone(),
             _ => return Err(SqlError::ExecuteReturnedResults),
         };
+        // Unmaterialized `COUNT(*)` over an unloaded file: answered from the
+        // B-Tree cell walk without loading any rows.
+        if let Some(n) = self.conn.fast_count_star(&stmt, &bound)? {
+            return Ok(MappedRows::single(self.conn, stmt, n, f));
+        }
+        self.conn.ensure_loaded()?;
         // Resolve outer LIMIT/OFFSET now so missing bindings error here,
         // exactly like the previous implementation.
         let (limit, offset) = match &stmt {
@@ -147,6 +156,10 @@ impl<'conn> Statement<'conn> {
             Stmt::Select { .. } | Stmt::Union { .. } => self.stmt.clone(),
             _ => return Err(SqlError::ExecuteReturnedResults),
         };
+        if let Some(n) = self.conn.fast_count_star(&stmt, &bound)? {
+            return Ok(vec![count_row(n)]);
+        }
+        self.conn.ensure_loaded()?;
         eval_select_to_rows(self.conn, &stmt, &bound)
     }
 
@@ -1382,6 +1395,11 @@ pub struct MappedRows<'conn, F> {
     join_pending: Vec<Vec<Value>>,
     join_pending_pos: usize,
     subselect_resolved: bool,
+    /// Unmaterialized fast-path rows (currently: file-level `COUNT(*)` over
+    /// an unloaded database). When `Some`, iteration yields exactly these
+    /// rows and then ends without touching the tables.
+    precomputed: Option<Vec<Row>>,
+    precomputed_pos: usize,
     mapper: F,
 }
 
@@ -1420,8 +1438,19 @@ impl<'conn, F> MappedRows<'conn, F> {
             join_pending: Vec::new(),
             join_pending_pos: 0,
             subselect_resolved: false,
+            precomputed: None,
+            precomputed_pos: 0,
             mapper,
         }
+    }
+
+    /// Iterator over one precomputed row (file-level `COUNT(*)` fast path).
+    /// The stored `stmt` is only inspected for mode switches that never
+    /// trigger before the precomputed rows are exhausted.
+    fn single(conn: &'conn Connection, stmt: Stmt, count: i64, mapper: F) -> Self {
+        let mut it = Self::new(conn, stmt, Vec::new(), None, None, mapper);
+        it.precomputed = Some(vec![count_row(count)]);
+        it
     }
 
     fn needs_buffered(&self) -> bool {
@@ -1701,6 +1730,21 @@ where
     type Item = Result<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Unmaterialized fast path: yield the precomputed rows, then end
+        // without touching table state.
+        if self.precomputed.is_some() {
+            let row = self
+                .precomputed
+                .as_ref()
+                .and_then(|rows| rows.get(self.precomputed_pos).cloned());
+            match row {
+                Some(row) => {
+                    self.precomputed_pos += 1;
+                    return Some((self.mapper)(&row));
+                }
+                None => return None,
+            }
+        }
         if !self.subselect_resolved {
             if let Err(e) = self.ensure_subselects() {
                 self.subselect_resolved = true;
