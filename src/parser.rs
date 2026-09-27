@@ -8,6 +8,8 @@
 
 use crate::error::{Result, SqlError};
 use crate::value::Value;
+use std::borrow::Cow;
+use std::collections::HashMap;
 
 /// A literal or bound parameter inside a statement.
 #[derive(Clone, Debug, PartialEq)]
@@ -155,6 +157,118 @@ impl WhereClause {
     }
 }
 
+/// Lowercase column-name to position map, built once per statement execution.
+///
+/// Uses first-match semantics, exactly like the `position()` scans in
+/// [`WhereClause::matches`], so compiled evaluation agrees with it row for row.
+pub(crate) fn column_index_map(columns: &[String]) -> HashMap<String, usize> {
+    let mut map = HashMap::with_capacity(columns.len());
+    for (idx, name) in columns.iter().enumerate() {
+        map.entry(name.to_ascii_lowercase()).or_insert(idx);
+    }
+    map
+}
+
+/// Resolve one expression against bound parameters a single time. Bounds are
+/// fixed for the whole scan, so looking them up per row is pure overhead.
+fn resolve_once(expr: &Expr, bound: &[Value]) -> Value {
+    match expr {
+        Expr::Placeholder(n) => bound.get(n - 1).cloned().unwrap_or(Value::Null),
+        Expr::Literal(v) => v.clone(),
+    }
+}
+
+/// A [`WhereClause`] with column names resolved to positions and bound
+/// parameters resolved to values. Per-row evaluation then performs zero
+/// string comparisons and zero parameter lookups.
+#[derive(Clone, Debug)]
+pub(crate) enum CompiledWhere {
+    Eq(usize, Value),
+    Cmp { idx: usize, op: CmpOp, expected: Value },
+    Like { idx: usize, pattern: Value, negate: bool },
+    In { idx: usize, values: Vec<Value>, negate: bool },
+    IsNull(usize),
+    IsNotNull(usize),
+    And(Vec<CompiledWhere>),
+    Or(Vec<CompiledWhere>),
+}
+
+impl WhereClause {
+    /// Compile column names and bound parameters away. Fails with
+    /// `InvalidColumnName` exactly like [`WhereClause::matches`].
+    pub(crate) fn compile(
+        &self,
+        map: &HashMap<String, usize>,
+        bound: &[Value],
+    ) -> Result<CompiledWhere> {
+        let idx = |col: &String| {
+            map.get(&col.to_ascii_lowercase())
+                .copied()
+                .ok_or_else(|| SqlError::InvalidColumnName(col.clone()))
+        };
+        match self {
+            WhereClause::Eq(col, expr) => Ok(CompiledWhere::Eq(idx(col)?, resolve_once(expr, bound))),
+            WhereClause::Cmp { col, op, expr } => Ok(CompiledWhere::Cmp {
+                idx: idx(col)?,
+                op: *op,
+                expected: resolve_once(expr, bound),
+            }),
+            WhereClause::Like { col, pattern, negate } => Ok(CompiledWhere::Like {
+                idx: idx(col)?,
+                pattern: resolve_once(pattern, bound),
+                negate: *negate,
+            }),
+            WhereClause::In { col, values, negate } => Ok(CompiledWhere::In {
+                idx: idx(col)?,
+                values: values.iter().map(|e| resolve_once(e, bound)).collect(),
+                negate: *negate,
+            }),
+            WhereClause::IsNull(col) => Ok(CompiledWhere::IsNull(idx(col)?)),
+            WhereClause::IsNotNull(col) => Ok(CompiledWhere::IsNotNull(idx(col)?)),
+            WhereClause::And(items) => items
+                .iter()
+                .map(|item| item.compile(map, bound))
+                .collect::<Result<Vec<_>>>()
+                .map(CompiledWhere::And),
+            WhereClause::Or(items) => items
+                .iter()
+                .map(|item| item.compile(map, bound))
+                .collect::<Result<Vec<_>>>()
+                .map(CompiledWhere::Or),
+        }
+    }
+}
+
+impl CompiledWhere {
+    /// Evaluate one row. Infallible: unknown columns were already rejected by
+    /// [`WhereClause::compile`], and `NULL` / type-mismatch rules mirror
+    /// [`WhereClause::matches`] exactly.
+    pub(crate) fn matches_row(&self, row: &[Value]) -> bool {
+        match self {
+            CompiledWhere::Eq(idx, expected) => values_equal(&row[*idx], expected),
+            CompiledWhere::Cmp { idx, op, expected } => eval_cmp(&row[*idx], expected, *op),
+            CompiledWhere::Like { idx, pattern, negate } => {
+                let matched = eval_like_borrowed(&row[*idx], pattern);
+                if *negate { !matched } else { matched }
+            }
+            CompiledWhere::In { idx, values, negate } => {
+                let mut found = false;
+                for candidate in values {
+                    if values_equal(&row[*idx], candidate) {
+                        found = true;
+                        break;
+                    }
+                }
+                if *negate { !found } else { found }
+            }
+            CompiledWhere::IsNull(idx) => row[*idx].is_null(),
+            CompiledWhere::IsNotNull(idx) => !row[*idx].is_null(),
+            CompiledWhere::And(items) => items.iter().all(|item| item.matches_row(row)),
+            CompiledWhere::Or(items) => items.iter().any(|item| item.matches_row(row)),
+        }
+    }
+}
+
 pub(crate) fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Null, Value::Null) => true,
@@ -248,18 +362,26 @@ pub(crate) fn sort_compare(a: &Value, b: &Value) -> std::cmp::Ordering {
     }
 }
 
-fn value_to_text(value: &Value) -> Option<String> {
+/// Borrow a value as text without cloning heap data: `Text` and `Blob`
+/// (when valid UTF-8) borrow in place; numbers format once into an owned
+/// string. Used by `LIKE` so full-table scans over text never clone per row.
+fn value_as_text<'a>(value: &'a Value) -> Option<Cow<'a, str>> {
     match value {
-        Value::Text(s) => Some(s.clone()),
-        Value::Integer(v) => Some(v.to_string()),
-        Value::Real(v) => Some(v.to_string()),
-        Value::Blob(bytes) => String::from_utf8(bytes.clone()).ok(),
+        Value::Text(s) => Some(Cow::Borrowed(s)),
+        Value::Integer(v) => Some(Cow::Owned(v.to_string())),
+        Value::Real(v) => Some(Cow::Owned(v.to_string())),
+        Value::Blob(bytes) => std::str::from_utf8(bytes).ok().map(Cow::Borrowed),
         Value::Null => None,
     }
 }
 
 pub(crate) fn eval_like(actual: &Value, pattern: &Value) -> bool {
-    match (value_to_text(actual), value_to_text(pattern)) {
+    eval_like_borrowed(actual, pattern)
+}
+
+/// Allocation-free `LIKE` evaluation on borrowed text.
+pub(crate) fn eval_like_borrowed(actual: &Value, pattern: &Value) -> bool {
+    match (value_as_text(actual), value_as_text(pattern)) {
         (Some(text), Some(pat)) => like_match(&text, &pat),
         _ => false,
     }

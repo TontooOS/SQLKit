@@ -2,7 +2,9 @@
 
 use crate::connection::Connection;
 use crate::error::{Result, SqlError};
-use crate::parser::{sort_compare, Expr, LimitValue, OrderBy, Stmt, WhereClause};
+use crate::parser::{
+    column_index_map, sort_compare, CompiledWhere, Expr, LimitValue, OrderBy, Stmt, WhereClause,
+};
 use crate::value::{FromValue, IntoParams, Value};
 
 /// A single result row.
@@ -73,7 +75,13 @@ impl<'conn> Statement<'conn> {
             Stmt::Select { .. } => Err(SqlError::ExecuteReturnedResults),
             other => {
                 let owned = other.clone();
-                self.conn.run_stmt(&owned, &bound)
+                let changed = self.conn.run_stmt(&owned, &bound)?;
+                // File-backed prepared writes are durable, exactly like
+                // `Connection::execute`; deferred while a transaction is open.
+                if crate::connection::is_write(&owned) {
+                    self.conn.persist_if_needed()?;
+                }
+                Ok(changed)
             }
         }
     }
@@ -190,26 +198,71 @@ impl<'conn> Statement<'conn> {
     }
 }
 
-pub(crate) fn project_row(
-    table_cols: &[String],
-    table_row: &[Value],
+/// Query plan compiled once per scan: resolved table key, output columns,
+/// projection indices and filter. Per-row work is then pure indexing with no
+/// string comparisons and no per-row schema clones. The table rows themselves
+/// are still read lazily one at a time, so the streaming guarantee holds.
+#[derive(Clone, Debug)]
+struct ScanPlan {
+    table_key: String,
+    ncols: usize,
+    out_columns: Vec<String>,
+    proj: Option<Vec<usize>>,
+    filter: Option<CompiledWhere>,
+}
+
+fn build_plan(
+    conn: &Connection,
+    table: &str,
     requested: &[String],
     star: bool,
-) -> Result<(Vec<String>, Vec<Value>)> {
-    if star {
-        return Ok((table_cols.to_vec(), table_row.to_vec()));
+    filter: Option<&WhereClause>,
+    bound: &[Value],
+) -> Result<ScanPlan> {
+    let inner = conn.inner.borrow();
+    let table_key = table.to_ascii_lowercase();
+    let tbl = inner.tables.get(&table_key).ok_or_else(|| SqlError::SqliteFailure {
+        code: 1,
+        message: format!("no such table: {table}"),
+    })?;
+    let table_cols: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
+    let map = column_index_map(&table_cols);
+    let (out_columns, proj) = if star {
+        (table_cols.clone(), None)
+    } else {
+        let mut idxs = Vec::with_capacity(requested.len());
+        let mut names = Vec::with_capacity(requested.len());
+        for name in requested {
+            let i = map
+                .get(&name.to_ascii_lowercase())
+                .copied()
+                .ok_or_else(|| SqlError::InvalidColumnName(name.clone()))?;
+            idxs.push(i);
+            names.push(table_cols[i].clone());
+        }
+        (names, Some(idxs))
+    };
+    let filter = filter.map(|f| f.compile(&map, bound)).transpose()?;
+    Ok(ScanPlan {
+        table_key,
+        ncols: table_cols.len(),
+        out_columns,
+        proj,
+        filter,
+    })
+}
+
+fn project_planned(plan: &ScanPlan, row: &[Value]) -> Row {
+    match &plan.proj {
+        None => Row {
+            columns: plan.out_columns.clone(),
+            values: row.to_vec(),
+        },
+        Some(idxs) => Row {
+            columns: plan.out_columns.clone(),
+            values: idxs.iter().map(|&i| row[i].clone()).collect(),
+        },
     }
-    let mut columns = Vec::with_capacity(requested.len());
-    let mut values = Vec::with_capacity(requested.len());
-    for name in requested {
-        let idx = table_cols
-            .iter()
-            .position(|c| c.eq_ignore_ascii_case(name))
-            .ok_or_else(|| SqlError::InvalidColumnName(name.clone()))?;
-        columns.push(table_cols[idx].clone());
-        values.push(table_row[idx].clone());
-    }
-    Ok((columns, values))
 }
 
 /// Resolve a `LIMIT` / `OFFSET` bound to a row count.
@@ -308,19 +361,17 @@ pub(crate) fn collect_rows(
 ) -> Result<Vec<Row>> {
     let limit = resolve_limit_opt(limit, bound, false)?;
     let offset = resolve_limit_opt(offset, bound, true)?;
+    let plan = build_plan(conn, table, requested, star, filter, bound)?;
     let inner = conn.inner.borrow();
-    let tbl = inner.tables.get(&table.to_ascii_lowercase()).ok_or_else(|| {
-        SqlError::SqliteFailure {
-            code: 1,
-            message: format!("no such table: {table}"),
-        }
+    let tbl = inner.tables.get(&plan.table_key).ok_or_else(|| SqlError::SqliteFailure {
+        code: 1,
+        message: format!("no such table: {table}"),
     })?;
-    let table_cols: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
     if count_star {
         let mut count = 0i64;
         for row in &tbl.rows {
-            let keep = match filter {
-                Some(f) => f.matches(&table_cols, row, bound)?,
+            let keep = match &plan.filter {
+                Some(f) => f.matches_row(row),
                 None => true,
             };
             if keep {
@@ -331,8 +382,8 @@ pub(crate) fn collect_rows(
     }
     let mut matched: Vec<Vec<Value>> = Vec::new();
     for row in &tbl.rows {
-        let keep = match filter {
-            Some(f) => f.matches(&table_cols, row, bound)?,
+        let keep = match &plan.filter {
+            Some(f) => f.matches_row(row),
             None => true,
         };
         if keep {
@@ -340,13 +391,13 @@ pub(crate) fn collect_rows(
         }
     }
     if !order_by.is_empty() {
+        let table_cols: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
         sort_table_rows(&table_cols, &mut matched, order_by)?;
     }
     let matched = apply_offset_limit(matched, offset, limit);
     let mut out = Vec::with_capacity(matched.len());
     for row in &matched {
-        let (columns, values) = project_row(&table_cols, row, requested, star)?;
-        out.push(Row { columns, values });
+        out.push(project_planned(&plan, row));
     }
     Ok(out)
 }
@@ -373,6 +424,10 @@ pub struct MappedRows<'conn, F> {
     offset: Option<i64>,
     count_star: bool,
     bound: Vec<Value>,
+    /// Compiled on first `next()` so `query_map` itself keeps its current
+    /// behavior (table and column errors surface during iteration, exactly
+    /// like the previous per-row resolution).
+    plan: Option<ScanPlan>,
     pos: usize,
     skipped: usize,
     emitted: usize,
@@ -408,6 +463,7 @@ impl<'conn, F> MappedRows<'conn, F> {
             offset,
             count_star,
             bound,
+            plan: None,
             pos: 0,
             skipped: 0,
             emitted: 0,
@@ -417,6 +473,32 @@ impl<'conn, F> MappedRows<'conn, F> {
             sorted_pos: 0,
             mapper,
         }
+    }
+
+    /// Compile the scan plan on first use. Afterwards every row is evaluated
+    /// with pure indexing: no table-key hashing beyond the lookup, no column
+    /// clones, no string comparisons.
+    fn ensure_plan(&mut self) -> Result<()> {
+        if self.plan.is_none() {
+            let plan = build_plan(
+                self.conn,
+                &self.table,
+                &self.requested,
+                self.star,
+                self.filter.as_ref(),
+                &self.bound,
+            )?;
+            self.plan = Some(plan);
+        }
+        Ok(())
+    }
+
+    /// Drop a stale plan (column count changed mid-iteration, only possible
+    /// through transactional DDL + rollback under the iterator) and rebuild
+    /// it from the stored statement parts.
+    fn ensure_plan_rebuild(&mut self) -> Result<()> {
+        self.plan = None;
+        self.ensure_plan()
     }
 
     fn offset_remaining(&self) -> usize {
@@ -433,9 +515,12 @@ impl<'conn, F> MappedRows<'conn, F> {
     /// Buffer only the filtered rows, sort them, then trim to the
     /// `OFFSET` / `LIMIT` window. Runs once on the first `next()`.
     fn init_sorted(&mut self) -> Result<()> {
-        let (table_cols, full_rows) = {
+        self.ensure_plan()?;
+        let (table_cols, full_rows, plan) = {
             let inner = self.conn.inner.borrow();
-            let tbl = inner.tables.get(&self.table.to_ascii_lowercase()).ok_or_else(|| {
+            // Clone the small plan for use after the borrow ends.
+            let plan = self.plan.as_ref().expect("plan ensured").clone();
+            let tbl = inner.tables.get(&plan.table_key).ok_or_else(|| {
                 SqlError::SqliteFailure {
                     code: 1,
                     message: format!("no such table: {}", self.table),
@@ -444,23 +529,22 @@ impl<'conn, F> MappedRows<'conn, F> {
             let table_cols: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
             let mut full_rows = Vec::new();
             for row in &tbl.rows {
-                let keep = match &self.filter {
-                    Some(f) => f.matches(&table_cols, row, &self.bound)?,
+                let keep = match &plan.filter {
+                    Some(f) => f.matches_row(row),
                     None => true,
                 };
                 if keep {
                     full_rows.push(row.clone());
                 }
             }
-            (table_cols, full_rows)
+            (table_cols, full_rows, plan)
         };
         let mut full_rows = full_rows;
         sort_table_rows(&table_cols, &mut full_rows, &self.order_by)?;
         let full_rows = apply_offset_limit(full_rows, self.offset, self.limit);
         let mut out = Vec::with_capacity(full_rows.len());
         for row in &full_rows {
-            let (columns, values) = project_row(&table_cols, row, &self.requested, self.star)?;
-            out.push(Row { columns, values });
+            out.push(project_planned(&plan, row));
         }
         self.sorted = out;
         self.sorted_pos = 0;
@@ -473,19 +557,22 @@ impl<'conn, F> MappedRows<'conn, F> {
             return None;
         }
         self.count_done = true;
+        if let Err(e) = self.ensure_plan() {
+            return Some(Err(e));
+        }
         let result = (|| {
             let inner = self.conn.inner.borrow();
-            let tbl = inner.tables.get(&self.table.to_ascii_lowercase()).ok_or_else(|| {
+            let plan = self.plan.as_ref().expect("plan ensured");
+            let tbl = inner.tables.get(&plan.table_key).ok_or_else(|| {
                 SqlError::SqliteFailure {
                     code: 1,
                     message: format!("no such table: {}", self.table),
                 }
             })?;
-            let table_cols: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
             let mut count = 0i64;
             for row in &tbl.rows {
-                let keep = match &self.filter {
-                    Some(f) => f.matches(&table_cols, row, &self.bound)?,
+                let keep = match &plan.filter {
+                    Some(f) => f.matches_row(row),
                     None => true,
                 };
                 if keep {
@@ -532,10 +619,33 @@ where
         if self.limit_reached() {
             return None;
         }
+        // Compile the plan on first use so column and filter errors surface
+        // during iteration, exactly like the previous per-row resolution.
+        if let Err(e) = self.ensure_plan() {
+            return Some(Err(e));
+        }
         loop {
-            let (columns, values) = {
+            let row = {
                 let inner = self.conn.inner.borrow();
-                let tbl = match inner.tables.get(&self.table.to_ascii_lowercase()) {
+                // Reborrow the plan per row: the mapping closure runs without
+                // any borrow held, so it may write through the connection and
+                // only a stale schema (column count) forces a recompile.
+                let stale = match self.plan.as_ref() {
+                    Some(plan) => match inner.tables.get(&plan.table_key) {
+                        Some(tbl) => tbl.columns.len() != plan.ncols,
+                        None => false,
+                    },
+                    None => true,
+                };
+                if stale {
+                    drop(inner);
+                    match self.ensure_plan_rebuild() {
+                        Ok(()) => continue,
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+                let plan = self.plan.as_ref().expect("plan ensured");
+                let tbl = match inner.tables.get(&plan.table_key) {
                     Some(tbl) => tbl,
                     None => {
                         return Some(Err(SqlError::SqliteFailure {
@@ -547,14 +657,10 @@ where
                 if self.pos >= tbl.rows.len() {
                     return None;
                 }
-                let table_cols: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
                 let row = &tbl.rows[self.pos];
                 self.pos += 1;
-                let keep = match &self.filter {
-                    Some(f) => match f.matches(&table_cols, row, &self.bound) {
-                        Ok(keep) => keep,
-                        Err(e) => return Some(Err(e)),
-                    },
+                let keep = match &plan.filter {
+                    Some(f) => f.matches_row(row),
                     None => true,
                 };
                 if !keep {
@@ -567,13 +673,9 @@ where
                 if self.limit_reached() {
                     return None;
                 }
-                match project_row(&table_cols, row, &self.requested, self.star) {
-                    Ok(projected) => projected,
-                    Err(e) => return Some(Err(e)),
-                }
+                project_planned(plan, row)
             };
             self.emitted += 1;
-            let row = Row { columns, values };
             return Some((self.mapper)(&row));
         }
     }

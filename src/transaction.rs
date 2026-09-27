@@ -42,6 +42,9 @@ impl<'conn> Transaction<'conn> {
     pub fn commit(mut self) -> Result<()> {
         self.conn.commit_inner()?;
         self.committed = true;
+        // Writes were deferred while the transaction was open (see
+        // `persist_if_needed`); exactly one snapshot lands here.
+        self.conn.persist_if_needed()?;
         Ok(())
     }
 

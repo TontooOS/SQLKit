@@ -19,6 +19,7 @@ Dependency-light SQLite-compatible engine for TontooOS with a ruslite-compatible
 | Pager | [Pager.md](Pager.md) | File format, atomic snapshots, foreign-file policy |
 | Transaction | [Transaction.md](Transaction.md) | RAII transactions with commit and rollback |
 | FFI | [FFI.md](FFI.md) | C header and memory rules |
+| Performance | [Performance.md](Performance.md) | Benchmark method, budgets, and hotspot fixes |
 
 ## Quick Start
 
@@ -58,4 +59,5 @@ and [Parser.md](Parser.md) for the exact limits.
 
 ## Changelog
 
+- 2026-09-27: Performance pass: added `examples/perf.rs` harness with budgets, PK lookup cache, deferred transaction snapshots, compiled scan plans, borrow-based LIKE; documented in Performance.md.
 - 2026-09-27: Initial wiki created with all 7 feature pages.

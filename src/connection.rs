@@ -2,7 +2,7 @@
 
 use crate::error::{Result, SqlError};
 use crate::pager;
-use crate::parser::{self, ColumnDef, Expr, Stmt};
+use crate::parser::{self, ColumnDef, CompiledWhere, Expr, Stmt};
 use crate::statement::Statement;
 use crate::transaction::Transaction;
 use crate::value::{FromValue, IntoParams, Value};
@@ -62,6 +62,34 @@ pub(crate) struct Inner {
     pub last_rowid: i64,
     pub in_transaction: bool,
     pub backup: Option<HashMap<String, Table>>,
+    /// In-memory primary-key lookup cache: table key to (key value, row
+    /// position). Never serialized; rebuilt lazily from `tables` and
+    /// invalidated on any `UPDATE`, `DELETE` or rollback. Turns the
+    /// per-insert uniqueness scan from O(rows) into O(1).
+    pub pk_cache: HashMap<String, HashMap<PkKey, usize>>,
+}
+
+/// Hashable primary-key value for [`Inner::pk_cache`]. Real keys use raw
+/// bits so every value maps deterministically.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum PkKey {
+    Null,
+    Integer(i64),
+    Real(u64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+impl PkKey {
+    fn of(value: &Value) -> Self {
+        match value {
+            Value::Null => Self::Null,
+            Value::Integer(v) => Self::Integer(*v),
+            Value::Real(v) => Self::Real(v.to_bits()),
+            Value::Text(s) => Self::Text(s.clone()),
+            Value::Blob(b) => Self::Blob(b.clone()),
+        }
+    }
 }
 
 /// Database connection. Mirrors the `rusqlite::Connection` subset used by
@@ -82,6 +110,7 @@ impl Connection {
                 last_rowid: 0,
                 in_transaction: false,
                 backup: None,
+                pk_cache: HashMap::new(),
             }),
         }
     }
@@ -112,11 +141,18 @@ impl Connection {
         Ok(Self::fresh(None))
     }
 
-    fn persist_if_needed(&self) -> Result<()> {
-        let path = self.inner.borrow().path.clone();
-        if let Some(path) = path {
-            let tables = self.inner.borrow().tables.clone();
-            pager::save(&path, &tables)?;
+    /// Write the file snapshot when it is due. Skipped while a transaction
+    /// is open so bulk loads inside `transaction()` produce exactly one
+    /// snapshot at commit instead of one per row; the file then always
+    /// equals the last committed state. Borrows the tables in place instead
+    /// of cloning them first.
+    pub(crate) fn persist_if_needed(&self) -> Result<()> {
+        if self.inner.borrow().in_transaction {
+            return Ok(());
+        }
+        let inner = self.inner.borrow();
+        if let Some(path) = inner.path.clone() {
+            pager::save(&path, &inner.tables)?;
         }
         Ok(())
     }
@@ -258,23 +294,29 @@ impl Connection {
             } => {
                 let mut inner = self.inner.borrow_mut();
                 let key = table.to_ascii_lowercase();
-                let tbl = inner.tables.get_mut(&key).ok_or_else(|| SqlError::SqliteFailure {
-                    code: 1,
-                    message: format!("no such table: {table}"),
-                })?;
-                let target: Vec<usize> = if columns.is_empty() {
-                    (0..tbl.columns.len()).collect()
-                } else {
-                    columns
-                        .iter()
-                        .map(|c| {
-                            tbl.column_index(c)
-                                .ok_or_else(|| SqlError::InvalidColumnName(c.clone()))
-                        })
-                        .collect::<Result<Vec<_>>>()?
+                // Resolve target slots and the primary-key position with a
+                // short shared borrow; the mutation below re-borrows.
+                let (target, pk, width) = {
+                    let tbl = inner.tables.get(&key).ok_or_else(|| SqlError::SqliteFailure {
+                        code: 1,
+                        message: format!("no such table: {table}"),
+                    })?;
+                    let target: Vec<usize> = if columns.is_empty() {
+                        (0..tbl.columns.len()).collect()
+                    } else {
+                        columns
+                            .iter()
+                            .map(|c| {
+                                tbl.column_index(c)
+                                    .ok_or_else(|| SqlError::InvalidColumnName(c.clone()))
+                            })
+                            .collect::<Result<Vec<_>>>()?
+                    };
+                    (target, tbl.primary_key_index(), tbl.columns.len())
                 };
-                let pk = tbl.primary_key_index();
-                let mut changed = 0;
+                // Resolve all rows before mutating, so a bad parameter leaves
+                // the table untouched.
+                let mut staged = Vec::with_capacity(rows.len());
                 for exprs in rows {
                     if exprs.len() != target.len() {
                         return Err(SqlError::InvalidParameterCount {
@@ -282,14 +324,44 @@ impl Connection {
                             got: exprs.len(),
                         });
                     }
-                    let mut row = vec![Value::Null; tbl.columns.len()];
+                    let mut row = vec![Value::Null; width];
                     for (slot, expr) in target.iter().zip(exprs.iter()) {
                         row[*slot] = resolve_expr(expr, bound)?;
                     }
-                    if let Some(pk_idx) = pk {
-                        if let Some(existing) = tbl.rows.iter().position(|r| r[pk_idx] == row[pk_idx]) {
+                    staged.push(row);
+                }
+                let mut changed = 0;
+                if let Some(pk_idx) = pk {
+                    // Build the PK cache on first use; afterwards every
+                    // uniqueness check is O(1) instead of a full row scan.
+                    if !inner.pk_cache.contains_key(&key) {
+                        let mut map = HashMap::new();
+                        if let Some(tbl) = inner.tables.get(&key) {
+                            map.reserve(tbl.rows.len());
+                            for (pos, row) in tbl.rows.iter().enumerate() {
+                                map.insert(PkKey::of(&row[pk_idx]), pos);
+                            }
+                        }
+                        inner.pk_cache.insert(key.clone(), map);
+                    }
+                    // NOTE: the cache and the table cannot be borrowed at once
+                    // (both go through the same `RefMut`), so each row does
+                    // one short cache probe, one table write, then one cache
+                    // update in sequence. Each step is O(1).
+                    for row in staged {
+                        let lookup = PkKey::of(&row[pk_idx]);
+                        let existing = inner
+                            .pk_cache
+                            .get(&key)
+                            .and_then(|m| m.get(&lookup))
+                            .copied();
+                        if let Some(pos) = existing {
                             if *or_replace {
-                                tbl.rows[existing] = row;
+                                inner
+                                    .tables
+                                    .get_mut(&key)
+                                    .expect("table checked above")
+                                    .rows[pos] = row;
                                 changed += 1;
                             } else if *or_ignore {
                                 continue;
@@ -300,13 +372,25 @@ impl Connection {
                                 });
                             }
                         } else {
-                            tbl.rows.push(row);
+                            let pos = {
+                                let tbl =
+                                    inner.tables.get_mut(&key).expect("table checked above");
+                                let pos = tbl.rows.len();
+                                tbl.rows.push(row);
+                                pos
+                            };
+                            inner
+                                .pk_cache
+                                .get_mut(&key)
+                                .expect("cache just built")
+                                .insert(lookup, pos);
                             changed += 1;
                         }
-                    } else {
-                        tbl.rows.push(row);
-                        changed += 1;
                     }
+                } else {
+                    let tbl = inner.tables.get_mut(&key).expect("table checked above");
+                    changed = staged.len();
+                    tbl.rows.extend(staged);
                 }
                 inner.last_rowid += changed as i64;
                 inner.changes = changed;
@@ -320,56 +404,85 @@ impl Connection {
             } => {
                 let mut inner = self.inner.borrow_mut();
                 let key = table.to_ascii_lowercase();
-                let tbl = inner.tables.get_mut(&key).ok_or_else(|| SqlError::SqliteFailure {
-                    code: 1,
-                    message: format!("no such table: {table}"),
-                })?;
-                let col_names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
-                let slots: Vec<(usize, Expr)> = assignments
-                    .iter()
-                    .map(|(col, expr)| {
-                        tbl.column_index(col)
-                            .map(|idx| (idx, expr.clone()))
-                            .ok_or_else(|| SqlError::InvalidColumnName(col.clone()))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                // Compile assignments and the filter once; per-row work is
+                // then pure indexing with no string comparisons.
+                let (slots, compiled): (Vec<(usize, Expr)>, Option<CompiledWhere>) = {
+                    let tbl = inner.tables.get(&key).ok_or_else(|| SqlError::SqliteFailure {
+                        code: 1,
+                        message: format!("no such table: {table}"),
+                    })?;
+                    let slots: Vec<(usize, Expr)> = assignments
+                        .iter()
+                        .map(|(col, expr)| {
+                            tbl.column_index(col)
+                                .map(|idx| (idx, expr.clone()))
+                                .ok_or_else(|| SqlError::InvalidColumnName(col.clone()))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let col_names: Vec<String> =
+                        tbl.columns.iter().map(|c| c.name.clone()).collect();
+                    let map = parser::column_index_map(&col_names);
+                    let compiled = filter
+                        .as_ref()
+                        .map(|f| f.compile(&map, bound))
+                        .transpose()?;
+                    (slots, compiled)
+                };
                 let mut changed = 0;
-                for row in tbl.rows.iter_mut() {
-                    let keep = match filter {
-                        Some(f) => f.matches(&col_names, row, bound)?,
-                        None => true,
-                    };
-                    if keep {
-                        for (slot, expr) in &slots {
-                            row[*slot] = resolve_expr(expr, bound)?;
+                {
+                    let tbl = inner.tables.get_mut(&key).expect("table checked above");
+                    for row in tbl.rows.iter_mut() {
+                        let keep = match &compiled {
+                            Some(f) => f.matches_row(row),
+                            None => true,
+                        };
+                        if keep {
+                            for (slot, expr) in &slots {
+                                row[*slot] = resolve_expr(expr, bound)?;
+                            }
+                            changed += 1;
                         }
-                        changed += 1;
                     }
                 }
+                // Row positions may have shifted values; drop the PK cache so
+                // the next insert rebuilds it from current rows.
+                inner.pk_cache.remove(&key);
                 inner.changes = changed;
                 Ok(changed)
             }
             Stmt::Delete { table, filter } => {
                 let mut inner = self.inner.borrow_mut();
                 let key = table.to_ascii_lowercase();
-                let tbl = inner.tables.get_mut(&key).ok_or_else(|| SqlError::SqliteFailure {
-                    code: 1,
-                    message: format!("no such table: {table}"),
-                })?;
-                let col_names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
-                let before = tbl.rows.len();
+                let compiled: Option<CompiledWhere> = {
+                    let tbl = inner.tables.get(&key).ok_or_else(|| SqlError::SqliteFailure {
+                        code: 1,
+                        message: format!("no such table: {table}"),
+                    })?;
+                    let col_names: Vec<String> =
+                        tbl.columns.iter().map(|c| c.name.clone()).collect();
+                    let map = parser::column_index_map(&col_names);
+                    filter
+                        .as_ref()
+                        .map(|f| f.compile(&map, bound))
+                        .transpose()?
+                };
+                let before = inner.tables.get(&key).expect("table checked above").rows.len();
                 let mut kept = Vec::with_capacity(before);
-                for row in tbl.rows.drain(..) {
-                    let remove = match filter {
-                        Some(f) => f.matches(&col_names, &row, bound)?,
-                        None => true,
-                    };
-                    if !remove {
-                        kept.push(row);
+                {
+                    let tbl = inner.tables.get_mut(&key).expect("table checked above");
+                    for row in tbl.rows.drain(..) {
+                        let remove = match &compiled {
+                            Some(f) => f.matches_row(&row),
+                            None => true,
+                        };
+                        if !remove {
+                            kept.push(row);
+                        }
                     }
+                    tbl.rows = kept;
                 }
-                tbl.rows = kept;
-                let changed = before - tbl.rows.len();
+                inner.pk_cache.remove(&key);
+                let changed = before - inner.tables.get(&key).expect("table checked above").rows.len();
                 inner.changes = changed;
                 Ok(changed)
             }
@@ -407,6 +520,8 @@ impl Connection {
         if let Some(backup) = inner.backup.take() {
             inner.tables = backup;
         }
+        // Restored rows invalidate cached PK positions.
+        inner.pk_cache.clear();
         inner.in_transaction = false;
         inner.changes = 0;
         Ok(())
@@ -423,7 +538,10 @@ pub(crate) fn resolve_expr(expr: &Expr, bound: &[Value]) -> Result<Value> {
     }
 }
 
-fn is_write(stmt: &Stmt) -> bool {
+/// True for statements that change durable state and therefore need a file
+/// snapshot afterwards. `Begin` only snapshots memory and `Rollback`
+/// restores memory to the last persisted state, so neither touches the file.
+pub(crate) fn is_write(stmt: &Stmt) -> bool {
     matches!(
         stmt,
         Stmt::CreateTable { .. }
@@ -432,9 +550,7 @@ fn is_write(stmt: &Stmt) -> bool {
             | Stmt::Update { .. }
             | Stmt::Delete { .. }
             | Stmt::Pragma { .. }
-            | Stmt::Begin
             | Stmt::Commit
-            | Stmt::Rollback
     )
 }
 
@@ -497,8 +613,81 @@ mod tests {
     }
 
     #[test]
-    fn select_order_limit_offset_and_in() {
+    fn pk_cache_invalidated_by_delete_and_update() {
         let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        conn.execute("INSERT INTO t (id, v) VALUES (?1, ?2)", crate::params![1i32, 10i32]).unwrap();
+        // Duplicate must fail (populates the PK cache on the first insert).
+        let dup = conn.execute("INSERT INTO t (id, v) VALUES (?1, ?2)", crate::params![1i32, 20i32]);
+        assert!(dup.is_err());
+        // After DELETE the key is reusable.
+        conn.execute("DELETE FROM t WHERE id = ?1", crate::params![1i32]).unwrap();
+        conn.execute("INSERT INTO t (id, v) VALUES (?1, ?2)", crate::params![1i32, 30i32]).unwrap();
+        let v: i64 = conn.query_row("SELECT v FROM t WHERE id = ?1", crate::params![1i32], |row| row.get(0)).unwrap();
+        assert_eq!(v, 30);
+        // After UPDATE of the key the old key is reusable.
+        conn.execute("UPDATE t SET id = ?1 WHERE id = ?2", crate::params![2i32, 1i32]).unwrap();
+        conn.execute("INSERT INTO t (id, v) VALUES (?1, ?2)", crate::params![1i32, 40i32]).unwrap();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM t", (), |row| row.get(0)).unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn pk_cache_cleared_by_rollback() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        conn.execute("INSERT INTO t (id, v) VALUES (?1, ?2)", crate::params![1i32, 1i32]).unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            tx.execute("INSERT INTO t (id, v) VALUES (?1, ?2)", crate::params![2i32, 2i32]).unwrap();
+            tx.rollback().unwrap();
+        }
+        // Row 2 was rolled back: re-inserting it must succeed, and the
+        // pre-transaction row must still conflict.
+        conn.execute("INSERT INTO t (id, v) VALUES (?1, ?2)", crate::params![2i32, 3i32]).unwrap();
+        let dup = conn.execute("INSERT INTO t (id, v) VALUES (?1, ?2)", crate::params![1i32, 9i32]);
+        assert!(dup.is_err());
+    }
+
+    #[test]
+    fn transaction_defers_file_snapshot_until_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deferred.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        let before = std::fs::metadata(&path).unwrap().len();
+        let tx = conn.transaction().unwrap();
+        for i in 0..100i32 {
+            tx.execute("INSERT INTO t (id, v) VALUES (?1, ?2)", crate::params![i, i]).unwrap();
+        }
+        // No snapshot landed while the transaction was open.
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
+        tx.commit().unwrap();
+        // Commit flushed exactly the rows; reload proves durability.
+        assert!(std::fs::metadata(&path).unwrap().len() > before);
+        conn.close().unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM t", (), |row| row.get(0)).unwrap();
+        assert_eq!(n, 100);
+    }
+
+    #[test]
+    fn prepared_write_persists_file_backed_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stmt.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE t (id TEXT PRIMARY KEY, v INTEGER)").unwrap();
+            let mut stmt = conn.prepare("INSERT INTO t (id, v) VALUES (?1, ?2)").unwrap();
+            stmt.execute(crate::params!["a", 1i32]).unwrap();
+        }
+        let conn = Connection::open(&path).unwrap();
+        let v: i64 = conn.query_row("SELECT v FROM t WHERE id = ?1", crate::params!["a"], |row| row.get(0)).unwrap();
+        assert_eq!(v, 1);
+    }
+
+    #[test]
+    fn select_order_limit_offset_and_in() {        let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
         for i in 0..10i32 {
             conn.execute("INSERT INTO t (id, v) VALUES (?1, ?2)", crate::params![i, i * 10]).unwrap();
