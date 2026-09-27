@@ -123,4 +123,38 @@ mod integration_tests {
             .unwrap();
         assert_eq!(count, "x");
     }
+
+    #[test]
+    fn order_by_limit_over_twenty_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE scores (id INTEGER PRIMARY KEY, points INTEGER)")
+            .unwrap();
+        for i in 0..20i32 {
+            conn.execute(
+                "INSERT INTO scores (id, points) VALUES (?1, ?2)",
+                params![i, (i * 7) % 20],
+            )
+            .unwrap();
+        }
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM scores", params![], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total, 20);
+        let page: Vec<i64> = conn
+            .prepare("SELECT points FROM scores ORDER BY points DESC LIMIT 5 OFFSET 5")
+            .unwrap()
+            .query_map(params![], |row| row.get(0))
+            .unwrap()
+            .collect::<crate::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(page, vec![14, 13, 12, 11, 10]);
+        let asc: Vec<i64> = conn
+            .prepare("SELECT points FROM scores ORDER BY points ASC LIMIT 3")
+            .unwrap()
+            .query_map(params![], |row| row.get(0))
+            .unwrap()
+            .collect::<crate::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(asc, vec![0, 1, 2]);
+    }
 }

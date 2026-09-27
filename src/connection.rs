@@ -469,4 +469,47 @@ mod tests {
         let v: i32 = conn.query_row("SELECT v FROM t WHERE id = ?1", ("a",), |row| row.get(0)).unwrap();
         assert_eq!(v, 2);
     }
+
+    #[test]
+    fn update_and_delete_use_extended_filters() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id TEXT PRIMARY KEY, age INTEGER, tag TEXT)")
+            .unwrap();
+        for (id, age, tag) in [("a", 18i32, "x"), ("b", 30i32, "y"), ("c", 40i32, "z")] {
+            conn.execute(
+                "INSERT INTO t (id, age, tag) VALUES (?1, ?2, ?3)",
+                crate::params![id, age, tag],
+            )
+            .unwrap();
+        }
+        let changed = conn
+            .execute("UPDATE t SET tag = ?1 WHERE age >= ?2 OR id = ?3", crate::params!["old", 40i32, "a"])
+            .unwrap();
+        assert_eq!(changed, 2);
+        let removed = conn
+            .execute("DELETE FROM t WHERE tag NOT LIKE 'o%' AND age IS NOT NULL", ())
+            .unwrap();
+        assert_eq!(removed, 1);
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", (), |row| row.get(0))
+            .unwrap();
+        assert_eq!(left, 2);
+    }
+
+    #[test]
+    fn select_order_limit_offset_and_in() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        for i in 0..10i32 {
+            conn.execute("INSERT INTO t (id, v) VALUES (?1, ?2)", crate::params![i, i * 10]).unwrap();
+        }
+        let top: Vec<i64> = conn
+            .prepare("SELECT v FROM t WHERE id IN (?1, ?2, ?3) ORDER BY v DESC LIMIT 2")
+            .unwrap()
+            .query_map(crate::params![1i32, 5i32, 9i32], |row| row.get(0))
+            .unwrap()
+            .collect::<crate::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(top, vec![90i64, 50i64]);
+    }
 }

@@ -40,9 +40,24 @@ pub fn query_map<T, P, F>(&mut self, params: P, f: F) -> Result<MappedRows<'_, F
 
 Returns a lazy `Iterator<Item = Result<T>>` over mapped rows. Exactly one row is materialized at a time.
 
+Execution order is filter, then sort, then `OFFSET` / `LIMIT`:
+
+- Without `ORDER BY` the scan stays fully lazy: the filter evaluates per row, `OFFSET` skips matching rows, and the stream ends after `LIMIT` rows.
+- With `ORDER BY` only the filtered rows are buffered for sorting; the table itself is never copied unfiltered.
+- `SELECT COUNT(*)` yields exactly one integer row (single `COUNT(*)` column); `ORDER BY`, `LIMIT`, and `OFFSET` are ignored for counts.
+
 ```rust
 let names: Vec<String> = stmt
     .query_map(params![0i32], |row| row.get(0))
+    .unwrap()
+    .collect::<Result<Vec<_>>>()
+    .unwrap();
+```
+
+```rust
+let mut stmt = conn.prepare("SELECT name FROM t ORDER BY age DESC LIMIT 5 OFFSET 10").unwrap();
+let page: Vec<String> = stmt
+    .query_map(params![], |row| row.get(0))
     .unwrap()
     .collect::<Result<Vec<_>>>()
     .unwrap();
