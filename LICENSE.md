@@ -1,4 +1,4 @@
-# TontooOS Contribution-Only License (TCL) v26.1
+# TontooOS Contribution-Only License (TCL) v27.0
 
 Copyright (c) 2026 TontooOS. All rights reserved.
 
@@ -202,6 +202,6 @@ this license, you agree to the terms and conditions of this license.
 
 This license is identified as:
 
-TontooOS Contribution-Only License (TCL) v26.1
+TontooOS Contribution-Only License (TCL) v27.0
 
 Copyright (c) 2026 TontooOS. All rights reserved.

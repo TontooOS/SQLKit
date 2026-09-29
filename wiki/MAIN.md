@@ -3,7 +3,7 @@
 Dependency-light SQLite-compatible engine for TontooOS with a ruslite-compatible API, streaming iterators, and atomic file snapshots.
 
 - Repository: https://github.com/TontooOS/SQLKit
-- License: TCL v26.1
+- License: TCL v27.0
 - Version: 27.0.0
 
 ## Feature Index
