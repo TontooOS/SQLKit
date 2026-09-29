@@ -45,7 +45,7 @@ compile_error!("SQLKit only supports TontooOS / Arch Linux – use WSL ArchLinux
 /// Library version: (major, minor, patch).
 pub const SQLKIT_VERSION: (u32, u32, u32) = (26, 1, 0);
 /// Library version string.
-pub const SQLKIT_VERSION_STR: &str = "26.1.0";
+pub const SQLKIT_VERSION_STR: &str = "27.0.0";
 
 /// Convenience prelude mirroring the ruslite items CoreData uses.
 pub mod prelude {
