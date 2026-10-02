@@ -6,19 +6,20 @@ use crate::parser::{self, ColumnDef, CompiledWhere, Expr, Stmt};
 use crate::statement::Statement;
 use crate::transaction::Transaction;
 use crate::value::{FromValue, IntoParams, Value};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Column schema stored per table.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// Snapshot (de)serialization lives in [`crate::json`], so this stays a plain
+/// struct with no derive macros.
+#[derive(Clone, Debug)]
 pub struct Column {
     pub name: String,
     pub coltype: String,
     pub primary_key: bool,
     pub not_null: bool,
-    #[serde(default)]
     pub default: Option<Value>,
 }
 
@@ -35,7 +36,9 @@ impl From<&ColumnDef> for Column {
 }
 
 /// In-memory table: schema plus row store.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// Snapshot (de)serialization lives in [`crate::json`].
+#[derive(Clone, Debug)]
 pub struct Table {
     pub name: String,
     pub columns: Vec<Column>,

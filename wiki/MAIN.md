@@ -64,6 +64,7 @@ views are follow-up items. See [Pager.md](Pager.md) and
 
 ## Changelog
 
+- 2026-10-02: Dependency cleanup: `thiserror`, `serde` and `serde_json` removed. `SqlError` now has hand-written `Display` / `Error` impls, the snapshot body is encoded by the new `src/json.rs` on top of `foundation::serialization::JsonValue` (wire format unchanged), and SQLKit's only runtime dependency is Foundation. Documented in Pager.md.
 - 2026-09-27: Performance pass 3 (5/5 vs rusqlite): lazy open, rowid-max cache (fixes the native-write O(n^2) bulk-insert regression), dirty-flag persist skip, unmaterialized COUNT(*) cell walk; `tests/lazy.rs` (6 tests).
 - 2026-09-27: Security pass: enforced statement/batch/chain/parameter bounds, fixed char-boundary panic in schema splitting, checked rowid/key casts, O_EXCL unique temp files with 0600-at-creation, journal symlink refusal, streaming journal/recovery, FFI panic boundary (-4), error-echo truncation; `tests/security.rs` (17 tests); documented in Security.md.
 - 2026-09-27: B-Tree pager milestone 2 (NATIVE WRITE): `src/btree_write.rs` rebuilds real SQLite files on every commit (records, overflow, leaf/interior splits with root promotion, `sqlite_master`, schema cookie, freelist trunk, rollback journal with recovery, WAL refusal, snapshot migration); `tests/native_write.rs` proves rusqlite interop both directions (500 rows, reverse edits, crash recovery, freelist, cookie); documented in Pager.md.

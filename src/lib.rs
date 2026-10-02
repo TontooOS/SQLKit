@@ -27,6 +27,7 @@ pub mod btree_write;
 pub mod connection;
 pub mod error;
 pub mod ffi;
+pub mod json;
 pub mod pager;
 pub mod parser;
 pub mod statement;

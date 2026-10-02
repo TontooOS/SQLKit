@@ -113,8 +113,7 @@ pub fn load(path: &Path) -> Result<HashMap<String, Table>> {
     if json.is_empty() {
         return Ok(HashMap::new());
     }
-    let tables: HashMap<String, Table> =
-        serde_json::from_slice(&json).map_err(SqlError::Serde)?;
+    let tables = crate::json::parse_tables(&json)?;
     Ok(tables)
 }
 
@@ -137,7 +136,7 @@ pub fn save(path: &Path, tables: &HashMap<String, Table>) -> Result<()> {
         writer.write_all(&build_header())?;
         writer.write_all(SQLKIT_MARKER)?;
         writer.write_all(&SNAPSHOT_VERSION.to_be_bytes())?;
-        serde_json::to_writer(&mut writer, tables).map_err(SqlError::Serde)?;
+        writer.write_all(crate::json::write_tables(tables).as_bytes())?;
         writer.flush()?;
         let file = writer.into_inner().map_err(|e| SqlError::Io(e.into_error()))?;
         file.sync_all()?;

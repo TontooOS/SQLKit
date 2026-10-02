@@ -1,67 +1,101 @@
 //! Error types for SQLKit, modeled on the `rusqlite::Error` surface.
 
-use thiserror::Error;
-
 /// Main error type for SQLKit operations.
 ///
 /// The variants mirror the `rusqlite::Error` cases used by TontooOS
 /// (`SqliteFailure`, `ExecuteReturnedResults`, `QueryReturnedNoRows`, ...),
 /// plus engine-specific cases (`Parse`, `NotSqliteFile`, `Unsupported`).
-#[derive(Error, Debug)]
+#[derive(Debug)]
 pub enum SqlError {
-    #[error("SQLite failure {code}: {message}")]
     SqliteFailure { code: i32, message: String },
 
-    #[error("statement expected no rows but returned rows")]
     ExecuteReturnedResults,
 
-    #[error("multiple statements given where only one is allowed")]
     MultipleStatement,
 
-    #[error("invalid parameter count: expected {expected}, got {got}")]
     InvalidParameterCount { expected: usize, got: usize },
 
-    #[error("invalid parameter name: {0}")]
     InvalidParameterName(String),
 
-    #[error("value conversion to SQL failed: {0}")]
     ToSqlConversionFailure(String),
 
-    #[error("value conversion from SQL failed: {0}")]
     FromSqlConversionFailure(String),
 
-    #[error("query returned no rows")]
     QueryReturnedNoRows,
 
-    #[error("invalid column index: {0}")]
     InvalidColumnIndex(usize),
 
-    #[error("invalid column name: {0}")]
     InvalidColumnName(String),
 
-    #[error("invalid path: {0}")]
     InvalidPath(String),
 
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(std::io::Error),
 
-    #[error("serialization error: {0}")]
-    Serde(#[from] serde_json::Error),
+    Serde(String),
 
-    #[error("SQL parse error: {0}")]
     Parse(String),
 
-    #[error("not a SQLite file: {0}")]
     NotSqliteFile(String),
 
-    #[error("unsupported statement or feature: {0}")]
     Unsupported(String),
 
-    #[error("transaction error: {0}")]
     Transaction(String),
 
-    #[error("{0}")]
     Custom(String),
+}
+
+impl std::fmt::Display for SqlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SqlError::SqliteFailure { code, message } => {
+                write!(f, "SQLite failure {code}: {message}")
+            }
+            SqlError::ExecuteReturnedResults => {
+                f.write_str("statement expected no rows but returned rows")
+            }
+            SqlError::MultipleStatement => {
+                f.write_str("multiple statements given where only one is allowed")
+            }
+            SqlError::InvalidParameterCount { expected, got } => {
+                write!(f, "invalid parameter count: expected {expected}, got {got}")
+            }
+            SqlError::InvalidParameterName(name) => {
+                write!(f, "invalid parameter name: {name}")
+            }
+            SqlError::ToSqlConversionFailure(why) => {
+                write!(f, "value conversion to SQL failed: {why}")
+            }
+            SqlError::FromSqlConversionFailure(why) => {
+                write!(f, "value conversion from SQL failed: {why}")
+            }
+            SqlError::QueryReturnedNoRows => f.write_str("query returned no rows"),
+            SqlError::InvalidColumnIndex(idx) => write!(f, "invalid column index: {idx}"),
+            SqlError::InvalidColumnName(name) => write!(f, "invalid column name: {name}"),
+            SqlError::InvalidPath(path) => write!(f, "invalid path: {path}"),
+            SqlError::Io(e) => write!(f, "I/O error: {e}"),
+            SqlError::Serde(why) => write!(f, "serialization error: {why}"),
+            SqlError::Parse(why) => write!(f, "SQL parse error: {why}"),
+            SqlError::NotSqliteFile(why) => write!(f, "not a SQLite file: {why}"),
+            SqlError::Unsupported(why) => write!(f, "unsupported statement or feature: {why}"),
+            SqlError::Transaction(why) => write!(f, "transaction error: {why}"),
+            SqlError::Custom(msg) => f.write_str(msg),
+        }
+    }
+}
+
+impl std::error::Error for SqlError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SqlError::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for SqlError {
+    fn from(e: std::io::Error) -> Self {
+        SqlError::Io(e)
+    }
 }
 
 impl SqlError {

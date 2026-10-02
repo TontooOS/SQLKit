@@ -1,13 +1,13 @@
 //! SQL value model plus `ToSql` / `FromValue` conversions and `params!`.
 
 use crate::error::{Result, SqlError};
-use serde::{Deserialize, Serialize};
 
 /// A single SQL value.
 ///
 /// Mirrors `rusqlite::types::Value` so callers can migrate from rusqlite
-/// without rethinking their value handling.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// without rethinking their value handling. The legacy snapshot format is
+/// produced by [`crate::json`] (no derive macros, no third-party crates).
+#[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Null,
     Integer(i64),

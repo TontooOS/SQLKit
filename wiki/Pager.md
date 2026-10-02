@@ -76,6 +76,54 @@ through the same atomic rename in the same directory; no temp files survive
 a commit. Snapshot files never stored indexes, so file-side indexes appear
 only for indexes created after migration.
 
+## Snapshot JSON Codec
+
+`src/json.rs` encodes and decodes the legacy snapshot body. It is
+hand-written on top of `foundation::serialization::JsonValue`, so SQLKit
+depends on Foundation only and pulls in no serialization crates.
+
+```rust
+pub fn parse_tables(bytes: &[u8]) -> Result<HashMap<String, Table>>
+pub fn write_tables(tables: &HashMap<String, Table>) -> String
+pub fn value_to_json(value: &Value) -> JsonValue
+pub fn value_from_json(json: &JsonValue) -> Result<Value>
+pub fn column_to_json(column: &Column) -> JsonValue
+pub fn column_from_json(json: &JsonValue) -> Result<Column>
+pub fn table_to_json(table: &Table) -> JsonValue
+pub fn table_from_json(json: &JsonValue) -> Result<Table>
+```
+
+The wire format is unchanged from the previous `serde_json` backend, so
+existing snapshot files keep loading:
+
+| `Value` | JSON |
+|---|---|
+| `Null` | `null` |
+| `Integer(i64)` | integer literal |
+| `Real(f64)` | float literal, `2.0` keeps its fraction |
+| `Text(String)` | JSON string |
+| `Blob(Vec<u8>)` | array of byte integers, e.g. `[0,1,255]` |
+
+| Struct | JSON members (declaration order) |
+|---|---|
+| `Column` | `name`, `coltype`, `primary_key`, `not_null`, `default` |
+| `Table` | `name`, `columns`, `rows` |
+| `HashMap<String, Table>` | one member per table name |
+
+Behavior:
+
+- `Column::default` may be missing in the file; it decodes as `None`. When
+  present it is written as an explicit `null`, never omitted.
+- Returns `Err(SqlError::Serde)` when the root is not an object, a `rows`
+  entry is not an array, a `BLOB` holds a non-integer or an out-of-range
+  value, a `REAL`/`TEXT` member has the wrong type, or the body is not
+  UTF-8.
+- `Blob` is the only `Value` that maps to a JSON array; JSON booleans and
+  objects are rejected because SQL has no such value.
+- `Value`, `Column` and `Table` no longer carry `Serialize` / `Deserialize`
+  derives. Use the functions above (or `pager::save` / `pager::load`) to
+  write or read the snapshot format.
+
 ## Read Path
 
 `src/btree.rs` implements the milestone 1 read path for foreign SQLite

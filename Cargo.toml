@@ -14,9 +14,7 @@ categories = ["database"]
 readme = "README.md"
 
 [dependencies]
-thiserror = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+foundation = { package = "foundation", path = "../Foundation" }
 
 [dev-dependencies]
 tempfile = "3"
